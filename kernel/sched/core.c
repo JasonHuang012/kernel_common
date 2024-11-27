@@ -7689,6 +7689,8 @@ void sched_show_task(struct task_struct *p)
 {
 	unsigned long free;
 	int ppid;
+	char cmdline[128] = {0};
+	char cmd_len;
 
 	if (!try_get_task_stack(p))
 		return;
@@ -7703,9 +7705,16 @@ void sched_show_task(struct task_struct *p)
 	if (pid_alive(p))
 		ppid = task_pid_nr(rcu_dereference(p->real_parent));
 	rcu_read_unlock();
-	pr_cont(" stack:%-5lu pid:%-5d tgid:%-5d ppid:%-6d flags:0x%08lx\n",
+	pr_cont(" stack:%-5lu pid:%-5d tgid:%-5d ppid:%-6d(%-15.15s) flags:0x%08lx",
 		free, task_pid_nr(p), task_tgid_nr(p),
-		ppid, read_task_thread_flags(p));
+		ppid, find_task_by_vpid(ppid)->comm, read_task_thread_flags(p));
+
+	/* get process args of task cmdline, such as xxx.sh of "sh xxx.sh" */
+	cmd_len = get_cmdline(p, cmdline, 128);
+	if (cmd_len > strlen(p->comm)) {
+		pr_cont(" cmdline:%-32s", cmdline + strlen(p->comm) + 1);
+	}
+	pr_cont("\n");
 
 	print_worker_info(KERN_INFO, p);
 	print_stop_info(KERN_INFO, p);
