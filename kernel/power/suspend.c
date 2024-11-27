@@ -630,6 +630,16 @@ static int enter_state(suspend_state_t state)
  * Check if the value of @state represents one of the supported states,
  * execute enter_state() and update system suspend statistics.
  */
+ /*
+  * pm_suspend->enter_state->suspend_prepare->suspend_freeze_processes->freeze_processes->try_to_freeze_tasks(true)->freeze_task->fake_signal_wake_up->signal_wake_up
+  *                                                                   ->freeze_kernel_threads->try_to_freeze_tasks(false)->freeze_task->wake_up_state
+  *
+  *
+  * user process:
+  *	do_signal->get_signal->try_to_freeze->__refrigerator
+  * kernel thread:
+  *	try_to_freeze->__refrigerator
+  */
 int pm_suspend(suspend_state_t state)
 {
 	int error;

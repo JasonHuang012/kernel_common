@@ -51,9 +51,15 @@ static int try_to_freeze_tasks(bool user_only)
 		todo = 0;
 		read_lock(&tasklist_lock);
 		for_each_process_thread(g, p) {
+			/* 如果是当前进程，或者该进程已经freeze、或者正在freeze中，则继续遍历下一个进程 */
 			if (p == current || !freeze_task(p))
 				continue;
 
+			/* 如果该进程还没开始冻结，则开始触发冻结，todo计数加1，记录此类进程个数 */
+			/* 触发进程冻结流程:
+			 * fake_signal_wake_up(p); --> user process
+			 * wake_up_state(p, TASK_NORMAL); --> kernel thread
+			 */
 			todo++;
 		}
 		read_unlock(&tasklist_lock);
@@ -63,9 +69,12 @@ static int try_to_freeze_tasks(bool user_only)
 			todo += wq_busy;
 		}
 
+		/* todo为0，表示所进程都进程freeze完成或者正在顺利freeze中，则可以退出
+		 * 如果超过了限定的冻结时间freeze_timeout_msecs，默认20s，也退出
+		 */
 		if (!todo || time_after(jiffies, end_time))
 			break;
-
+		/* 检查是否需要中断freeze操作，待研究 */
 		if (pm_wakeup_pending()) {
 			wakeup = true;
 			break;
@@ -76,6 +85,7 @@ static int try_to_freeze_tasks(bool user_only)
 		 * time to enter the refrigerator.  Start with an initial
 		 * 1 ms sleep followed by exponential backoff until 8 ms.
 		 */
+		/* 让出cpu，给那些刚触发冻结的进程完成冻结 */
 		usleep_range(sleep_usecs / 2, sleep_usecs);
 		if (sleep_usecs < 8 * USEC_PER_MSEC)
 			sleep_usecs *= 2;
@@ -171,6 +181,7 @@ int freeze_kernel_threads(void)
 
 	BUG_ON(in_atomic());
 
+	/* 冻结失败，则恢复 */
 	if (error)
 		thaw_kernel_threads();
 	return error;
