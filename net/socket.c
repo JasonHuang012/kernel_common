@@ -1048,6 +1048,8 @@ static noinline void call_trace_sock_recv_length(struct sock *sk, int ret, int f
 static inline int sock_recvmsg_nosec(struct socket *sock, struct msghdr *msg,
 				     int flags)
 {
+	/* 如果sock->ops->revemsg刚好指向 inet6_recvmsg或inet_recvmsg，则直接调用这两个接口 */
+	/* 这样可以减少retpoline带来的开销，待研究 */
 	int ret = INDIRECT_CALL_INET(READ_ONCE(sock->ops)->recvmsg,
 				     inet6_recvmsg,
 				     inet_recvmsg, sock, msg,

@@ -102,6 +102,7 @@ extern void __cant_migrate(const char *file, int line);
  * be bitten later when the calling function happens to sleep when it is not
  * supposed to.
  */
+/* 用于标记可能在非原子上下文中执行，也就是可能睡眠，以确保不会在不允许睡眠的上下文中调用到这段代码 */
 # define might_sleep() \
 	do { __might_sleep(__FILE__, __LINE__); might_resched(); } while (0)
 /**

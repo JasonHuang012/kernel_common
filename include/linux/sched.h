@@ -2176,6 +2176,7 @@ extern long sched_getaffinity(pid_t pid, struct cpumask *mask);
 #endif
 
 #ifdef CONFIG_SMP
+/* 判断task是否正在运行 */
 static inline bool owner_on_cpu(struct task_struct *owner)
 {
 	/*

@@ -636,7 +636,11 @@ static int enter_state(suspend_state_t state)
   *
   *
   * user process:
-  *	do_signal->get_signal->try_to_freeze->__refrigerator
+  *	ret_to_user->do_signal->get_signal->try_to_freeze->__refrigerator
+  *
+  * arch/arm64/entry.S: ret_to_user->??
+  * arch/arm/entry-common.S: ret_to_user->slow_work_pending->do_work_pending->do_signal
+  *
   * kernel thread:
   *	try_to_freeze->__refrigerator
   */

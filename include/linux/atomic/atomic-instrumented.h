@@ -4472,6 +4472,10 @@ atomic_long_try_cmpxchg_acquire(atomic_long_t *v, long *old, long new)
  *
  * Return: @true if the exchange occured, @false otherwise.
  */
+/*
+ * 如果v 和 old的值相等，则将new的内容更新到v指向的内存中，返回true；
+ * 如果v 和 old的值不等，则v不变，将v的值更新到old指向的内存中，返回false；
+ */
 static __always_inline bool
 atomic_long_try_cmpxchg_release(atomic_long_t *v, long *old, long new)
 {

@@ -39,9 +39,11 @@
  *   locks and tasks (and only those tasks)
  */
 struct mutex {
+	/* 三种用途记录*/
 	atomic_long_t		owner;
 	raw_spinlock_t		wait_lock;
 #ifdef CONFIG_MUTEX_SPIN_ON_OWNER
+	/* 乐观自旋 */
 	struct optimistic_spin_queue osq; /* Spinner MCS lock */
 #endif
 	struct list_head	wait_list;

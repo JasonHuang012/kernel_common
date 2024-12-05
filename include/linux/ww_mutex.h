@@ -14,6 +14,9 @@
  * This file contains the main data structure and API definitions.
  */
 
+/* ww mutext：死锁避免机制，一种在多线程环境中避免死锁的策略
+ */
+
 #ifndef __LINUX_WW_MUTEX_H
 #define __LINUX_WW_MUTEX_H
 
@@ -52,6 +55,7 @@ struct ww_mutex {
 #endif
 };
 
+/* 用途? */
 struct ww_acquire_ctx {
 	struct task_struct *task;
 	unsigned long stamp;

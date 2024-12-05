@@ -7,6 +7,11 @@
 
 #ifndef __ASSEMBLY__
 
+/*
+ * yield指令用来告知硬件系统，本cpu上执行的指令是polling操作，没有那么急迫，
+ * 如果有任何的资源冲突，本cpu可以让出控制权。
+ * CPU 松弛下来，降低功耗，把资源配置给其他thread等,CPU 松弛下来，降低功耗，把资源配置给其他thread.
+ */
 static inline void cpu_relax(void)
 {
 	asm volatile("yield" ::: "memory");
