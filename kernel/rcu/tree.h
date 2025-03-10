@@ -338,7 +338,10 @@ struct sr_wait_node {
  * consisting of a single rcu_node.
  */
 struct rcu_state {
+	/* rcu node节点数组，组织成层级树状 */
+	/* cpu个数小于或等于16时，8个cpu为一组 */
 	struct rcu_node node[NUM_RCU_NODES];	/* Hierarchy. */
+	/* cpu个数小于或等于16时，RCU_NUM_LVLS为1，两个层级？待研究，加1是为了消除编译警告 */
 	struct rcu_node *level[RCU_NUM_LVLS + 1];
 						/* Hierarchy levels (+1 to */
 						/*  shut bogus gcc warning) */
@@ -349,6 +352,7 @@ struct rcu_state {
 
 	unsigned long gp_seq ____cacheline_internodealigned_in_smp;
 						/* Grace-period sequence #. */
+	/* 最长宽限期时间，jiffies */
 	unsigned long gp_max;			/* Maximum GP duration in */
 						/*  jiffies. */
 	struct task_struct *gp_kthread;		/* Task for grace periods. */

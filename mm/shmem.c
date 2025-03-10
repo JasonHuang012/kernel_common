@@ -4637,6 +4637,10 @@ static int shmem_fill_super(struct super_block *sb, struct fs_context *fc)
 
 #ifdef CONFIG_TMPFS
 	/*
+	 * 默认情况下，允许每个tmpfs实例最多使用一般的物理内存
+	 * 但是
+	 */
+	/*
 	 * Per default we only allow half of the physical ram per
 	 * tmpfs instance, limiting inodes to one per page of lowmem;
 	 * but the internal instance is left unlimited.

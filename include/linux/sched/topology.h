@@ -84,29 +84,59 @@ struct sched_domain_shared {
 	int		nr_idle_scan;
 };
 
+/*
+ * 调度域表示cpu物理拓扑结构中的层级关系，调度组是负载均衡的基本单位
+ * 一个调度域包含多个调度组，系统做负载均衡时，先保证一个调度域中的所有调度组的负载均衡，再考虑跨域的负载均衡 
+ */
 struct sched_domain {
 	/* These fields must be setup */
+	/* base domain的child为NULL，root domain的parent为NULL */
 	struct sched_domain __rcu *parent;	/* top domain must be null terminated */
 	struct sched_domain __rcu *child;	/* bottom domain must be null terminated */
+	/* 本调度域中的调度组，形成一个环形链表, groups为链表头 */
 	struct sched_group *groups;	/* the balancing groups of the domain */
+	/* 检查负载均衡的最小时间间隔，检查过于频繁会带来额外的系统开销 */
 	unsigned long min_interval;	/* Minimum balance interval ms */
+	/* 检查负载均衡的最小时间间隔，太长时间不检查会导致负载差异过大 */
 	unsigned long max_interval;	/* Maximum balance interval ms */
+	/*
+	 * 反应cpu忙碌程度的参数，系统会根据实际运行情况动态调整cpu负载均衡的时间间隔，该值记录在balance_interval字段中
+	 * 如果cpu很繁忙，时间间隔就适当延长一点: busy_factor * balance_interval
+	 */
 	unsigned int busy_factor;	/* less balancing by factor if busy */
+	/* 表示负载不均衡的阈值，调度域内的不均衡状态达到一定程度后就开始执行负载均衡 */
 	unsigned int imbalance_pct;	/* No balance until over watermark */
+	/* 和nr_balance_failed配合控制负载均衡中的迁移力度，当nr_balance_failed大于cache_nice_tries时，负载均衡会更加激进 */
 	unsigned int cache_nice_tries;	/* Leave cache hot tasks for # tries */
 	unsigned int imb_numa_nr;	/* Nr running tasks that allows a NUMA imbalance */
 
 	int nohz_idle;			/* NOHZ IDLE status */
 	int flags;			/* See SD_* */
+	/* 当前调度域在整个调度层级结构中的level,比如base调度域的level为0，向上依次加1,可以理解为调度域在树中的高度 */
 	int level;
 
 	/* Runtime fields. */
+	/*
+	 * 上一次做负载均衡的时间点，单位是jiffies
+	 * 通过基础均衡时间间隔和当前sd的状态可以计算最终的均衡间隔时间（get_sd_balance_interval），
+	 * last_balance加上这个计算得到的均衡时间间隔就是下一次均衡的时间点。
+	 */
 	unsigned long last_balance;	/* init to jiffies. units in jiffies */
+	/* 负载均衡的时间间隔，会随着系统的运行而变化 */
 	unsigned int balance_interval;	/* initialise to 1. units in ms. */
+	/* 负载均衡失败的次数统计，当失败次数大于cache_nice_tries的时候，我们考虑迁移cache hot的任务，进行更激进的均衡操作 */
 	unsigned int nr_balance_failed; /* initialise to 0 */
 
 	/* idle_balance() stats */
+	/*
+	 * 在该domain上进行newidle balance的最大时间长度（即newidle balance的开销）。
+	 * 最小值是sysctl_sched_migration_cost，是一个时间长度
+	 */
 	u64 max_newidle_lb_cost;
+	/*
+	 * 记录最近在该sched domain上进行newidle balance的最近时刻，是一个时间点
+	 * 上面的max_newidle_lb_cost不是一成不变的，它有一个衰减过程，每秒衰减1%，这个成员就是用来控制衰减的
+	 */
 	unsigned long last_decay_max_lb_cost;
 
 #ifdef CONFIG_SCHEDSTATS
@@ -147,8 +177,14 @@ struct sched_domain {
 		void *private;		/* used during construction */
 		struct rcu_head rcu;	/* used during destruction */
 	};
+	/*
+	 * 为了降低锁竞争， sched domain是per-cpu的
+	 * 然而有些信息是需要在per-cpu的sched domain之间共享的，不能在每个sched_domain上构建
+	 * 这些信息包括： 该sched domian中的busy cusy个数、是否有idle的cpu
+	 */
 	struct sched_domain_shared *shared;
 
+	/* 当前调度域有多少个cpu */
 	unsigned int span_weight;
 	/*
 	 * Span of all CPUs in this domain.
@@ -157,6 +193,7 @@ struct sched_domain {
 	 * by attaching extra space to the end of the structure,
 	 * depending on how many CPUs the kernel has booted up with)
 	 */
+	/* 当前调度域包含了哪些cpu，父调度域的span应该是所有子调度域的超集 */
 	unsigned long span[];
 };
 

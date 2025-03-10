@@ -43,6 +43,14 @@
 #define SDF_NEEDS_GROUPS       0x4
 
 /*
+SD_BALANCE_NEWIDLE	进入idle时进行均衡
+SD_BALANCE_EXEC		exec时进行均衡
+SD_BALANCE_FORK		fork时进行均衡
+SD_BALANCE_WAKE		任务唤醒时进行均衡
+SD_WAKE_AFFINE		任务唤醒时放置到临近CPU
+*/
+
+/*
  * Balance when about to become idle
  *
  * SHARED_CHILD: Set from the base domain up to cpuset.sched_relax_domain_level.

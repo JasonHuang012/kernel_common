@@ -8057,6 +8057,7 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
  *
  * Return: (Boosted) (estimated) utilization for the specified CPU.
  */
+/*待研究: cpu 利用率计算 */
 static unsigned long
 cpu_util(int cpu, struct task_struct *p, int dst_cpu, int boost)
 {
@@ -8964,6 +8965,7 @@ pick_next_task_fair(struct rq *rq, struct task_struct *prev, struct rq_flags *rf
 again:
 	p = pick_task_fair(rq);
 	if (!p)
+		/* 如果找不到可运行的任务，则尝试newidle balance*/
 		goto idle;
 	se = &p->se;
 
@@ -9019,6 +9021,7 @@ idle:
 	if (!rf)
 		return NULL;
 
+	/* 尝试newidle balance */
 	new_tasks = sched_balance_newidle(rq, rf);
 
 	/*
@@ -9029,6 +9032,7 @@ idle:
 	if (new_tasks < 0)
 		return RETRY_TASK;
 
+	/* 如果newidle balance能拉到任务，则重新pick task运行 */
 	if (new_tasks > 0)
 		goto again;
 
@@ -9301,28 +9305,57 @@ enum migration_type {
 	migrate_misfit
 };
 
-#define LBF_ALL_PINNED	0x01
-#define LBF_NEED_BREAK	0x02
-#define LBF_DST_PINNED  0x04
-#define LBF_SOME_PINNED	0x08
+#define LBF_ALL_PINNED	0x01 //所有的task都pin住了，无法迁移
+#define LBF_NEED_BREAK	0x02 //降低rq spinlock的持锁时间长度
+#define LBF_DST_PINNED  0x04 //因为affinity问题无法迁移任务到dst_cpu, 但可以迁移到sched_domain的其它cpu，会设置该标志，并重新选择新的dst_cpu(new_dst_cpu --> dst_cpu)
+#define LBF_SOME_PINNED	0x08 //因为affinity而无法迁移到当前sched_domain的任何一个cpu，则会让父调度域去解决
 #define LBF_ACTIVE_LB	0x10
 
+/* 负载均衡时，lb_env结构体用来为本次负载均衡的上下文, 在负载均衡上下文流程传递信息 */
 struct lb_env {
-	struct sched_domain	*sd;
+	struct sched_domain	*sd;		//要进行负载均衡的sched_domain
 
+	/*
+	 * 当前sched_doamin中最繁忙的cpu和对应的runqueue
+	 * 负载均衡的目标就是从该runqueue上拉取任务
+	 */
 	struct rq		*src_rq;
 	int			src_cpu;
 
+	/*
+	 * 本次均衡的目标cpu，和目标cpu的runqueue
+	 * 负载均衡一般先从尝试从该sched_domain的busiest cpu rq上拉取任务到dst_rq，
+	 * 第一轮均衡的dst_cpu和dst_rq一般设置为发起均衡的当前cpu和rq
+	 * 后续根据需要可以重新设定为local group中的其它cpu
+	 */
 	int			dst_cpu;
 	struct rq		*dst_rq;
 
+	/* dst_cpu所在sched_group的cpu mask，即本次均衡dst_cpu的范围 */
 	struct cpumask		*dst_grpmask;
+	/*
+	 * 一般来说均衡的目标cpu就是发起均衡的cpu，但是如果拉取的任务因为affinity的原因，
+	 * 无法迁移到dst cpu，则需要选择一个新的dst_cpu（local group内）作为新的dst_cpu，发起第二轮均衡
+	 */
 	int			new_dst_cpu;
+	/* 负载均衡时 dst_cpu的idle状态，该状态会影响均衡的走向, 0表示非idle */
 	enum cpu_idle_type	idle;
+	/*
+	 * 需要均衡的负载，需要结合migration_type
+	 * migrate_load --> 表示要迁移的负载量
+	 * migrate_util --> 表示要迁移的utility
+	 * migrate_task --> 表示要迁移的任务个数
+	 * migrage_misfit --> 为1
+	 */
 	long			imbalance;
 	/* The set of CPUs under consideration for load-balancing */
+	/*
+	 * 负载均衡中可能会有多轮均衡操作，不同轮次会涉及到不同的CPU,
+	 * 该成员表示本次均衡有哪些CPU参与
+	 */
 	struct cpumask		*cpus;
 
+	/* 负载均衡的标记，见上面的LBF_ */
 	unsigned int		flags;
 
 	unsigned int		loop;
@@ -9344,9 +9377,11 @@ static int task_hot(struct task_struct *p, struct lb_env *env)
 
 	lockdep_assert_rq_held(env->src_rq);
 
+	// 不是cfs task，cache cold
 	if (p->sched_class != &fair_sched_class)
 		return 0;
 
+	// 调度策略为idle policy
 	if (unlikely(task_has_idle_policy(p)))
 		return 0;
 
@@ -9357,10 +9392,12 @@ static int task_hot(struct task_struct *p, struct lb_env *env)
 	/*
 	 * Buddy candidates are cache hot:
 	 */
+	// task即将在原cpu上被调度到，cache hot
 	if (sched_feat(CACHE_HOT_BUDDY) && env->dst_rq->nr_running &&
 	    (&p->se == cfs_rq_of(&p->se)->next))
 		return 1;
 
+	// 迁移阈值为-1，cache hot
 	if (sysctl_sched_migration_cost == -1)
 		return 1;
 
@@ -9371,11 +9408,13 @@ static int task_hot(struct task_struct *p, struct lb_env *env)
 	if (!sched_core_cookie_match(cpu_rq(env->dst_cpu), p))
 		return 1;
 
+	// 迁移阈值为0，cache cold
 	if (sysctl_sched_migration_cost == 0)
 		return 0;
 
 	delta = rq_clock_task(env->src_rq) - p->se.exec_start;
 
+	// 运行时间小于迁移阈值，cache hot，反之为cache cokd，待研究，包括rq->clock_task的含义
 	return delta < (s64)sysctl_sched_migration_cost;
 }
 
@@ -9384,6 +9423,11 @@ static int task_hot(struct task_struct *p, struct lb_env *env)
  * Returns 1, if task migration degrades locality
  * Returns 0, if task migration improves locality i.e migration preferred.
  * Returns -1, if task migration is not affected by locality.
+ */
+/* 判断当前task迁移后对cache局部性的影响
+ * 1 : 会降低局部性，说明cache是hot的；
+ * 0 : 会提高局部性，说明cache是cold的
+ * -1: 对局部性无影响
  */
 static int migrate_degrades_locality(struct task_struct *p, struct lb_env *env)
 {
@@ -9461,18 +9505,26 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
 	 * 3) running (obviously), or
 	 * 4) are cache-hot on their current CPU.
 	 */
+	/*
+	 * throttle 节流
+	 * 节流任务不允许迁移，和cgroup带宽口控制有关，待研究
+	 */
 	if (throttled_lb_pair(task_group(p), env->src_cpu, env->dst_cpu))
 		return 0;
 
 	/* Disregard percpu kthreads; they are where they need to be. */
+	/* percpu的任务不能迁移 */
 	if (kthread_is_per_cpu(p))
 		return 0;
 
+	/* 如果该task，因为cpus allowed或者说affine问题而不能迁移到dst_cpu */
 	if (!cpumask_test_cpu(env->dst_cpu, p->cpus_ptr)) {
 		int cpu;
 
+		/* 统计因cpu亲和度导致迁移失败的调度统计信息 */
 		schedstat_inc(p->stats.nr_failed_migrations_affine);
 
+		/* 先设置SOME_PINNED标志, 后面看看能否转为DST_PINNED */
 		env->flags |= LBF_SOME_PINNED;
 
 		/*
@@ -9490,7 +9542,9 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
 			return 0;
 
 		/* Prevent to re-select dst_cpu via env's CPUs: */
+		// 重新选择新的dst_cpu
 		for_each_cpu_and(cpu, env->dst_grpmask, env->cpus) {
+			/* 如果可以迁移到当前sched_domain的其它cpu, 则设置为DST_PINNED, 并设置new_dst_cpu */
 			if (cpumask_test_cpu(cpu, p->cpus_ptr)) {
 				env->flags |= LBF_DST_PINNED;
 				env->new_dst_cpu = cpu;
@@ -9502,6 +9556,7 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
 	}
 
 	/* Record that we found at least one task that could run on dst_cpu */
+	/* 清除ALL_PINNED标志，前面已经找到合适的dst_cpu了 */
 	env->flags &= ~LBF_ALL_PINNED;
 
 	if (task_on_cpu(env->src_rq, p)) {
@@ -9519,19 +9574,23 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
 	if (env->flags & LBF_ACTIVE_LB)
 		return 1;
 
+	/* 判断该任务从src_cpu迁移dst_cpu，对局部性(cache)的影响 */
 	tsk_cache_hot = migrate_degrades_locality(p, env);
+	/* 返回-1，表示迁移该task到dst_cpu，不会影响局部性, 再看看该进程是不是cache hot */
 	if (tsk_cache_hot == -1)
 		tsk_cache_hot = task_hot(p, env);
 
+	// 如果cache不是hot的，或者均衡失败次数超了cache_nice_tries(就算cache为hot, 强制迁移)，都可以迁移 */
 	if (tsk_cache_hot <= 0 ||
 	    env->sd->nr_balance_failed > env->sd->cache_nice_tries) {
 		if (tsk_cache_hot == 1) {
-			schedstat_inc(env->sd->lb_hot_gained[env->idle]);
-			schedstat_inc(p->stats.nr_forced_migrations);
+			schedstat_inc(env->sd->lb_hot_gained[env->idle]);	//更新热缓存计数器
+			schedstat_inc(p->stats.nr_forced_migrations);		//更新强制迁计数器
 		}
 		return 1;
 	}
 
+	/* 如果因为cache hot而无法迁移，更新相应计数器 */
 	schedstat_inc(p->stats.nr_failed_migrations_hot);
 	return 0;
 }
@@ -9598,7 +9657,7 @@ static struct task_struct *detach_one_task(struct lb_env *env)
  */
 static int detach_tasks(struct lb_env *env)
 {
-	struct list_head *tasks = &env->src_rq->cfs_tasks;
+	struct list_head *tasks = &env->src_rq->cfs_tasks; //取出目标rq中的cfs任务队列
 	unsigned long util, load;
 	struct task_struct *p;
 	int detached = 0;
@@ -9617,31 +9676,38 @@ static int detach_tasks(struct lb_env *env)
 	if (env->imbalance <= 0)
 		return 0;
 
+	/* 遍历cfs tasks */
 	while (!list_empty(tasks)) {
 		/*
 		 * We don't want to steal all, otherwise we may be treated likewise,
 		 * which could at worst lead to a livelock crash.
 		 */
+		/* idle或者newly idle，并且rq只有一个任务（刚好就是在运行的那个任务），则不迁移任务，退出 */
 		if (env->idle && env->src_rq->nr_running <= 1)
 			break;
 
-		env->loop++;
+		env->loop++;	//记录遍历任务的次数
 		/* We've more or less seen every task there is, call it quits */
 		if (env->loop > env->loop_max)
 			break;
 
 		/* take a breather every nr_migrate tasks */
+		/* 当遍历次数大于32次时，先中断一下 */
 		if (env->loop > env->loop_break) {
 			env->loop_break += SCHED_NR_MIGRATE_BREAK;
+			/* 进入detach_tasks前，拿了rq spinlock，合理设置BREAK，先返回释放锁，再继续，避免单次持锁时间过长 */
 			env->flags |= LBF_NEED_BREAK;
 			break;
 		}
 
+		/* 取出队列中最后一个task */
 		p = list_last_entry(tasks, struct task_struct, se.group_node);
 
+		/* 判断该task能否迁移到dst_cpu */
 		if (!can_migrate_task(p, env))
 			goto next;
 
+		/* 根据不同迁移类型，计算该task对应的迁移量，load、uitl、task等 */
 		switch (env->migration_type) {
 		case migrate_load:
 			/*
@@ -9691,7 +9757,9 @@ static int detach_tasks(struct lb_env *env)
 			break;
 		}
 
+		// 把task从src_rq上取出
 		detach_task(p, env);
+		// 将task添加到env->tasks链表
 		list_add(&p->se.group_node, &env->tasks);
 
 		detached++;
@@ -9725,6 +9793,7 @@ next:
 	 */
 	schedstat_add(env->sd->lb_gained[env->idle], detached);
 
+	// 返回取出的task个数
 	return detached;
 }
 
@@ -11712,6 +11781,7 @@ static int should_we_balance(struct lb_env *env)
 	 * Ensure the balancing environment is consistent; can happen
 	 * when the softirq triggers 'during' hotplug.
 	 */
+	/* 判断目标cpu是否在线，可能因为hotplug关核了, 不在线就不做均衡 */
 	if (!cpumask_test_cpu(env->dst_cpu, env->cpus))
 		return 0;
 
@@ -11722,14 +11792,15 @@ static int should_we_balance(struct lb_env *env)
 	 * However, we bail out if we already have tasks or a wakeup pending,
 	 * to optimize wakeup latency.
 	 */
+	/* 如果是即将进入idle的CPU，只要rq上没有任务，并且没有将要被唤醒的进程，就可以做均衡，反之则不做均衡 */
 	if (env->idle == CPU_NEWLY_IDLE) {
 		if (env->dst_rq->nr_running > 0 || env->dst_rq->ttwu_pending)
-			return 0;
 		return 1;
 	}
 
 	cpumask_copy(swb_cpus, group_balance_mask(sg));
 	/* Try to find first idle CPU */
+	/* 找到sched_group中第一个idle CPU */
 	for_each_cpu_and(cpu, swb_cpus, env->cpus) {
 		if (!idle_cpu(cpu))
 			continue;
@@ -11757,20 +11828,65 @@ static int should_we_balance(struct lb_env *env)
 		 * Are we the first idle core in a non-SMT domain or higher,
 		 * or the first idle CPU in a SMT domain?
 		 */
+		/*
+		 * 到这里已经找到了sg中的第一个idle CPU，
+		 * 看看目标CPU是不是就是第一个idle CPU，如果是才能继续均衡
+		 */
 		return cpu == env->dst_cpu;
 	}
 
 	/* Are we the first idle CPU with busy siblings? */
+	/* 到这里说明没有找到一个idle cpu，但是也可能存在一个idle smt，看看是不是dst_cpu */
 	if (idle_smt != -1)
 		return idle_smt == env->dst_cpu;
 
 	/* Are we the first CPU of this group ? */
+	/* 如果没有idle cpu，则看看目标cpu是不是sg中第一个可用作均衡的cpu */
 	return group_balance_cpu(sg) == env->dst_cpu;
 }
 
 /*
  * Check this_cpu to ensure it is balanced within domain. Attempt to move
  * tasks if there is an imbalance.
+ */
+
+/* 以前的函数名叫 load_balance() */
+/*
+ * sched_balance_rq的调用路径
+ * sched_tick
+	->sched_balance_trigger
+		-> raise_softirq(SCHED_SOFTIRQ);
+			-> sched_balance_softirq
+				-> (1) nohz_idle_balance				//nohz idle balancer，拉取任务到已经进入idle的CPU
+					-> _nohz_idle_balance
+						-> sched_balance_domains(rq, CPU_IDLE);
+							-> sched_balance_rq
+				-> (2) sched_balance_domains(this_rq, idle);	//periodic balancer，周期性balance
+					-> sched_balance_rq
+		-> nohz_balancer_kick(rq);
+			->kick_ilb
+				->smp_call_function_single_async(ilb_cpu, &cpu_rq(ilb_cpu)->nohz_csd); //IPI中断
+
+ * pick_next_task (cfs fair)
+	->__pick_next_task_fair
+		->pick_next_task_fair
+			->sched_balance_newidle  (如果pick不到task)		//newidle balancer，CPU即将进入idle时发生
+				->sched_balance_rq
+
+ * 负载均衡的三种类型
+	periodic balancer : 针对busy CPU，任务在busy CPU之间均衡，执行对象为busy CPU；
+			    周期性负载均衡是自底向上的均衡过程，即从该CPU的base sched domain开始，向上直到顶层sched domain。
+
+	newidle balancer  : 针对即将进入idle的CPU，从busy CPU拉取任务到即将进入idle的CPU，执行对象为当前即将进入idle的CPU；
+
+	nohz idle balancer: 针对已经进入idle的CPU，从busy CPU拉取任务到已经进入idle的CPU，执行对象为busy CPU；
+			    当其它CPU错过newidle balancer进入了idle后，当前CPU如果任务太重，则通过IPI将其它idle CPU唤醒来进行负载均衡；
+			    nohz idle balancer只有在内核配置了nohz下才会生效（tickless mode），如果本CPU进入idle后还有周期性的tick，
+			    那直接使用periodic balancer就可以完成负载均衡了，不需要其它CPU通过IPI唤醒。和周期性负载均衡一样，nohz idle
+			    balancer也是通过busy CPU的tick驱动的， nohz_balancer_kick会通过GIC发送一个IPI中断给选中的idle CPU，让它代表
+			    系统所有的idle CPU进行负载均衡，nohz idle balance也是自底向上均衡的。
+			    nohz idle balance本质上也是另一种周期性均衡负载，只是因为本CPU进入了idle，无法产生tick，因此让能长生tick的
+			    busy CPU来帮忙粗发tick balance。最后也都是通过sched_balance_domains函数来处理。
  */
 static int sched_balance_rq(int this_cpu, struct rq *this_rq,
 			struct sched_domain *sd, enum cpu_idle_type idle,
@@ -11781,35 +11897,41 @@ static int sched_balance_rq(int this_cpu, struct rq *this_rq,
 	struct sched_group *group;
 	struct rq *busiest;
 	struct rq_flags rf;
-	struct cpumask *cpus = this_cpu_cpumask_var_ptr(load_balance_mask);
+	struct cpumask *cpus = this_cpu_cpumask_var_ptr(load_balance_mask); //待研究
+	/* lb_env结构初始化 */
 	struct lb_env env = {
 		.sd		= sd,
 		.dst_cpu	= this_cpu,
 		.dst_rq		= this_rq,
-		.dst_grpmask    = group_balance_mask(sd->groups),
-		.idle		= idle,
-		.loop_break	= SCHED_NR_MIGRATE_BREAK,
+		.dst_grpmask    = group_balance_mask(sd->groups),	//获取要做均衡的sched_domain对应的sg范围
+		.idle		= idle,					//dst_cpu的idle状态
+		.loop_break	= SCHED_NR_MIGRATE_BREAK,		//遍历任务是达到32次就退出休息一下，主要是释放锁、开中断
 		.cpus		= cpus,
 		.fbq_type	= all,
-		.tasks		= LIST_HEAD_INIT(env.tasks),
+		.tasks		= LIST_HEAD_INIT(env.tasks),		//初始化task链表，后续要迁移的task会放到这个链表
 	};
 
+	/* 获取sd中所有active的cpu，保存到cpus中 */
 	cpumask_and(cpus, sched_domain_span(sd), cpu_active_mask);
 
+	/* 更新load balance次数 */
 	schedstat_inc(sd->lb_count[idle]);
 
 redo:
+	/* 判断目标cpu是否可以做负载均衡(第一轮均衡，dst_cpu一般是当前cpu) */
 	if (!should_we_balance(&env)) {
-		*continue_balancing = 0;
+		*continue_balancing = 0;	//不能均衡就清空continue_balancing，退出到sched_balance_domains时判断为0直接跳出均衡
 		goto out_balanced;
 	}
 
+	/* 找到当前sched_doamin中负载最重的sched_group */
 	group = sched_balance_find_src_group(&env);
 	if (!group) {
 		schedstat_inc(sd->lb_nobusyg[idle]);
 		goto out_balanced;
 	}
 
+	/* 找到负载最重的sg中，所有cpu中的最重负载的CPU的rq */
 	busiest = sched_balance_find_src_rq(&env, group);
 	if (!busiest) {
 		schedstat_inc(sd->lb_nobusyq[idle]);
@@ -11818,6 +11940,10 @@ redo:
 
 	WARN_ON_ONCE(busiest == env.dst_rq);
 
+	/* sd->lb_imbalance[idle] += env.imbalance
+	 * env.imbalance在上面的sched_balance_find_src_group->calculate_imbalance中获取
+	 * env.imbalance是需要迁移的负载
+	 */
 	schedstat_add(sd->lb_imbalance[idle], env.imbalance);
 
 	env.src_cpu = busiest->cpu;
@@ -11825,7 +11951,9 @@ redo:
 
 	ld_moved = 0;
 	/* Clear this flag as soon as we find a pullable task */
+	/* 先初始化flags为ALL PINNED，下面一找到可以均衡的task，里面会更新  */
 	env.flags |= LBF_ALL_PINNED;
+	/* nr_runningtask至少要大于等于2，说明至少有一个任务可迁移 */
 	if (busiest->nr_running > 1) {
 		/*
 		 * Attempt to move tasks. If sched_balance_find_src_group has found
@@ -11833,9 +11961,10 @@ redo:
 		 * still unbalanced. ld_moved simply stays zero, so it is
 		 * correctly treated as an imbalance.
 		 */
-		env.loop_max  = min(sysctl_sched_nr_migrate, busiest->nr_running);
+		env.loop_max  = min(sysctl_sched_nr_migrate, busiest->nr_running); //限制遍历任务的次数不能超过32，因为期间是关中断的
 
 more_balance:
+		/* 拿runqueue的spinlock, 禁止本地中断 */
 		rq_lock_irqsave(busiest, &rf);
 		env.src_rq_rf = &rf;
 		update_rq_clock(busiest);
@@ -11843,6 +11972,11 @@ more_balance:
 		/*
 		 * cur_ld_moved - load moved in current iteration
 		 * ld_moved     - cumulative load moved across iterations
+		 */
+		/*
+		 * balance可能会有多轮
+		 * cur_ld_moved: 本次均衡中一轮balance操作迁移出来的task数量
+		 * ld_moved: 本次均衡中多轮balance操作累计迁移出来的task总数量
 		 */
 		cur_ld_moved = detach_tasks(&env);
 
@@ -11854,15 +11988,19 @@ more_balance:
 		 * See task_rq_lock() family for the details.
 		 */
 
+		/* 释放rq spinlock，中断还没使能 */
 		rq_unlock(busiest, &rf);
 
 		if (cur_ld_moved) {
+			// 把上面取出来的task，全部放置到dst_rq中
 			attach_tasks(&env);
 			ld_moved += cur_ld_moved;
 		}
 
+		/* 恢复中断使能 */
 		local_irq_restore(rf.flags);
 
+		/* detach_tasks中设置LBF_NEED_BREAK，跳出释放rq spinlock，这里清除标志并继续进行balance */
 		if (env.flags & LBF_NEED_BREAK) {
 			env.flags &= ~LBF_NEED_BREAK;
 			goto more_balance;
@@ -11887,9 +12025,15 @@ more_balance:
 		 * moreover subsequent load balance cycles should correct the
 		 * excess load moved.
 		 */
+		/*
+		 * 如果上面出现了因为cpu亲和度而无法迁移到dst_cpu的task，但可以迁移到sched_group中的其它cpu，
+		 * 则在这里重新设置dst_cpu，并返回重试
+		 * imbalance > 0表示仍存在不平衡情况
+		 */
 		if ((env.flags & LBF_DST_PINNED) && env.imbalance > 0) {
 
 			/* Prevent to re-select dst_cpu via env's CPUs */
+			/* 移除原来不亲和的dst_cpu，避免又遇到affinity问题 */
 			__cpumask_clear_cpu(env.dst_cpu, env.cpus);
 
 			env.dst_rq	 = cpu_rq(env.new_dst_cpu);
@@ -11908,15 +12052,20 @@ more_balance:
 		/*
 		 * We failed to reach balance because of affinity.
 		 */
+		/* 如果是LBF_SOME_PINNED，则让父调度域去解决 */
 		if (sd_parent) {
+			/* group_classify */
 			int *group_imbalance = &sd_parent->groups->sgc->imbalance;
 
+			/* 设置父调度域的imbalance，增加父调度域rebalance的几率 */
 			if ((env.flags & LBF_SOME_PINNED) && env.imbalance > 0)
 				*group_imbalance = 1;
 		}
 
 		/* All tasks on this runqueue were pinned by CPU affinity */
+		/* 如果dst_cpu上所有task都因为affinity，而无法迁移 */
 		if (unlikely(env.flags & LBF_ALL_PINNED)) {
+			/* 将busiest cpu从cpus合集中去掉 */
 			__cpumask_clear_cpu(cpu_of(busiest), cpus);
 			/*
 			 * Attempting to continue load balancing at the current
@@ -11926,16 +12075,24 @@ more_balance:
 			 * destination group that is receiving any migrated
 			 * load.
 			 */
+			/* 如果剩余的cpu都不在当前调度域的dts cpu集合中，说明有可能没办法继续做负载均衡了 */
 			if (!cpumask_subset(cpus, env.dst_grpmask)) {
 				env.loop = 0;
 				env.loop_break = SCHED_NR_MIGRATE_BREAK;
-				goto redo;
+				goto redo;		//返回再次判断是否需要balance
 			}
 			goto out_all_pinned;
 		}
 	}
 
+	/*
+	 * balance失败，原因有：
+	 * 1. busiset->nr_running <= 1, 也就是没有课迁移的task;
+	 * 2. 经过几轮的尝试，还是没有可迁移的task
+	 * 开始尝试激进的均衡方法
+	 */
 	if (!ld_moved) {
+		// 更新均衡失败次数
 		schedstat_inc(sd->lb_failed[idle]);
 		/*
 		 * Increment the failure counter only on periodic balance.
@@ -11946,10 +12103,19 @@ more_balance:
 		 * Similarly for migration_misfit which is not related to
 		 * load/util migration, don't pollute nr_balance_failed.
 		 */
+		/*
+		 * 只统计周期性balance的均衡失败次数
+		 * 因为newly idle balance可能会很频繁失败，容易导致激进的balance
+		 */
 		if (idle != CPU_NEWLY_IDLE &&
 		    env.migration_type != migrate_misfit)
-			sd->nr_balance_failed++;
+			sd->nr_balance_failed++;	// 更新balance失败次数
 
+		/*
+		 * 是否需要active balance，也叫主动迁移
+		 * active balance就是把正在运行的任务迁移到dst_cpu上，也就是说经过前面一番折腾
+		 * runnable的任务都无法迁移到dst_cpu，从而达到均衡，那么就考虑当前正在运行的任务。
+		 */
 		if (need_active_balance(&env)) {
 			unsigned long flags;
 
@@ -11960,12 +12126,17 @@ more_balance:
 			 * if the curr task on busiest CPU can't be
 			 * moved to this_cpu:
 			 */
+			 /*
+			  * 如果busiest cpu的current进程的cpuset不包含dst_cpu，
+			  * 则不触发active_load_balance_cpu_stop(待研究)
+			  */
 			if (!cpumask_test_cpu(this_cpu, busiest->curr->cpus_ptr)) {
 				raw_spin_rq_unlock_irqrestore(busiest, flags);
 				goto out_one_pinned;
 			}
 
 			/* Record that we found at least one task that could run on this_cpu */
+			/* 到这里至少有一个任务可以迁移到dst_cpu */
 			env.flags &= ~LBF_ALL_PINNED;
 
 			/*
@@ -11973,14 +12144,20 @@ more_balance:
 			 * ->active_balance_work.  Once set, it's cleared
 			 * only after active load balance is finished.
 			 */
+			/* active_balance标记是与active_balance_work同步的，一旦设置，只在active load balance完成后清除 */
+			/* busiest cpu没有处于active balance */
 			if (!busiest->active_balance) {
-				busiest->active_balance = 1;
-				busiest->push_cpu = this_cpu;
+				busiest->active_balance = 1;	//设置active_balance
+				busiest->push_cpu = this_cpu;	//push_cpu为当前cpu，也就是dst_cpu
 				active_balance = 1;
 			}
 
 			preempt_disable();
 			raw_spin_rq_unlock_irqrestore(busiest, flags);
+			/*
+			 * 触发active_balance，更加的激进，采用了一个stop class的进程（stop > deadline > real time> fair > idle)，
+			 * 同时将src rq的running的task重新enqueue到rq中成为runnable状态，这样将running的task纳入到了load balance的范围。
+			 */
 			if (active_balance) {
 				stop_one_cpu_nowait(cpu_of(busiest),
 					active_load_balance_cpu_stop, busiest,
@@ -12203,15 +12380,18 @@ static inline bool update_newidle_cost(struct sched_domain *sd, u64 cost)
 		 */
 		sd->max_newidle_lb_cost = cost;
 		sd->last_decay_max_lb_cost = jiffies;
+	/* + HZ，表示至少每次过1秒，对max_newidle_lb_cost进行衰减一次 */
 	} else if (time_after(jiffies, sd->last_decay_max_lb_cost + HZ)) {
 		/*
 		 * Decay the newidle max times by ~1% per second to ensure that
 		 * it is not outdated and the current max cost is actually
 		 * shorter.
 		 */
+		/* 253/256 = 0.988, 大约衰减1% */
 		sd->max_newidle_lb_cost = (sd->max_newidle_lb_cost * 253) / 256;
 		sd->last_decay_max_lb_cost = jiffies;
 
+		/* 超过1秒后，返回true，表示需要衰减*/
 		return true;
 	}
 
@@ -12242,12 +12422,20 @@ static void sched_balance_domains(struct rq *rq, enum cpu_idle_type idle)
 		return;
 
 	rcu_read_lock();
+	/* 从当前cpu所处的shed doamin遍历，逐步向上一级sd */
 	for_each_domain(cpu, sd) {
 		/*
 		 * Decay the newidle max times here because this is a regular
 		 * visit to all the domains.
 		 */
+		/*
+		 * max_newidle_lb_cost是sched domain上最大的newidle load balance开销，
+		 * 在sched_balance_newidle中初始化max_newidle_lb_cost
+		 * 这个开销会随着时间衰减，每秒衰减1%
+		 * need_decay 表示是否需要再次衰减
+		 */
 		need_decay = update_newidle_cost(sd, 0);
+		/* 累加各个sd的max_newidle_lb_cost，后面需要更新到rq对应的变量中 */
 		max_cost += sd->max_newidle_lb_cost;
 
 		/*
@@ -12255,7 +12443,20 @@ static void sched_balance_domains(struct rq *rq, enum cpu_idle_type idle)
 		 * CPU in our sched group which is doing load balancing more
 		 * actively.
 		 */
+		/*
+		 *
+		 */
+		/*
+		 * continue_balancing用于控制是否继续进行负载均衡
+		 * 不需要均衡 且 不需要衰减，则跳出循环，退出均衡
+		 */
 		if (!continue_balancing) {
+			/*
+			 * 如果不需要均衡，但是需要衰减，则继续循环
+			 * 再对上一级的max_newidle_lb_cost做衰减
+			 * 这里是一个特殊场景：只需要更新rq的max_idle_balance_cost，遍历各个sd，再做累加
+			 * 把各个层级衰减的max_newidle_lb_cost体现到rq的max_newidle_balance_cost中
+			 */
 			if (need_decay)
 				continue;
 			break;
@@ -12295,6 +12496,7 @@ out:
 		 * Ensure the rq-wide value also decays but keep it at a
 		 * reasonable floor to avoid funnies with rq->avg_idle.
 		 */
+		/* 需要把衰减过的max_newidle_lb_cost更新到rq->max_idle_balance_cost中 */
 		rq->max_idle_balance_cost =
 			max((u64)sysctl_sched_migration_cost, max_cost);
 	}
@@ -12367,6 +12569,7 @@ static void kick_ilb(unsigned int flags)
 	if (flags & NOHZ_BALANCE_KICK)
 		nohz.next_balance = jiffies+1;
 
+	/* 获取合适的idle cpu */
 	ilb_cpu = find_new_ilb();
 	if (ilb_cpu < 0)
 		return;
@@ -12390,6 +12593,14 @@ static void kick_ilb(unsigned int flags)
 	 * This way we generate an IPI on the target CPU which
 	 * is idle, and the softirq performing NOHZ idle load balancing
 	 * will be run before returning from the IPI.
+	 */
+	/*
+	 * 发送IPI中断唤醒ide cpu，唤醒后调用nohz_csd->func进行处理
+	 * 初始化的地方
+		sched_init:
+		#ifdef CONFIG_NO_HZ_COMMON
+			INIT_CSD(&rq->nohz_csd, nohz_csd_func, rq);
+	 * 所以唤醒后的IPI会调用nohz_csd_func，最后触发SCHED_SOFTIRQ进行负载均衡
 	 */
 	smp_call_function_single_async(ilb_cpu, &cpu_rq(ilb_cpu)->nohz_csd);
 }
@@ -12688,6 +12899,7 @@ static void _nohz_idle_balance(struct rq *this_rq, unsigned int flags)
 	 * chance for other idle cpu to pull load.
 	 */
 	for_each_cpu_wrap(balance_cpu,  nohz.idle_cpus_mask, this_cpu+1) {
+		/* 只针对idle CPU */
 		if (!idle_cpu(balance_cpu))
 			continue;
 
@@ -12695,6 +12907,10 @@ static void _nohz_idle_balance(struct rq *this_rq, unsigned int flags)
 		 * If this CPU gets work to do, stop the load balancing
 		 * work being done for other CPUs. Next load
 		 * balancing owner will pick it up.
+		 */
+		/*
+		 * 如果当前执行nohz idle balance的idle CPU突然有任务要处理，则直接退出
+		 * 由下一轮nohz idle balance继续处理
 		 */
 		if (need_resched()) {
 			if (flags & NOHZ_STATS_KICK)
@@ -12704,6 +12920,7 @@ static void _nohz_idle_balance(struct rq *this_rq, unsigned int flags)
 			goto abort;
 		}
 
+		/* 获取目标cpu的runqueue */
 		rq = cpu_rq(balance_cpu);
 
 		if (flags & NOHZ_STATS_KICK)
@@ -12713,6 +12930,7 @@ static void _nohz_idle_balance(struct rq *this_rq, unsigned int flags)
 		 * If time for next balance is due,
 		 * do the balance.
 		 */
+		/* 到next_balance时间点才进行均衡 */
 		if (time_after_eq(jiffies, rq->next_balance)) {
 			struct rq_flags rf;
 
@@ -12761,6 +12979,10 @@ static bool nohz_idle_balance(struct rq *this_rq, enum cpu_idle_type idle)
 
 	this_rq->nohz_idle_balance = 0;
 
+	/*
+	 * 如果当前cpu不是idle CPU，则退出
+	 * 当前这个idle CPU代表系统所有idle CPU进行nohz idle负载均衡，为其它idle CPU拉取任务
+	 */
 	if (idle != CPU_IDLE)
 		return false;
 
@@ -12845,6 +13067,9 @@ static inline void nohz_newidle_balance(struct rq *this_rq) { }
  *     0 - failed, no new tasks
  *   > 0 - success, new (fair) tasks present
  */
+/*
+ * 就像上面注释的，当一个cpu进入idle之前，会尝试从其它忙碌的cpu拉取task
+ */
 static int sched_balance_newidle(struct rq *this_rq, struct rq_flags *rf)
 {
 	unsigned long next_balance = jiffies + HZ;
@@ -12865,6 +13090,7 @@ static int sched_balance_newidle(struct rq *this_rq, struct rq_flags *rf)
 	 * There is a task waiting to run. No need to search for one.
 	 * Return 0; the task will be enqueued when switching to idle.
 	 */
+	/* 如果刚好rq中有一个task等待运行，则直接返回 */
 	if (this_rq->ttwu_pending)
 		return 0;
 
@@ -12878,6 +13104,7 @@ static int sched_balance_newidle(struct rq *this_rq, struct rq_flags *rf)
 	/*
 	 * Do not pull tasks towards !active CPUs...
 	 */
+	/* 不要从不活跃的cpu上拉取task */
 	if (!cpu_active(this_cpu))
 		return 0;
 
@@ -12892,7 +13119,9 @@ static int sched_balance_newidle(struct rq *this_rq, struct rq_flags *rf)
 	rcu_read_lock();
 	sd = rcu_dereference_check_sched_domain(this_rq->sd);
 
+	/* root domain有没有overload的cpu */
 	if (!get_rd_overloaded(this_rq->rd) ||
+	   /* 或者 rqde avg_idle小于max_newidle_lb_cost */
 	    (sd && this_rq->avg_idle < sd->max_newidle_lb_cost)) {
 
 		if (sd)
@@ -12925,6 +13154,7 @@ static int sched_balance_newidle(struct rq *this_rq, struct rq_flags *rf)
 
 			t1 = sched_clock_cpu(this_cpu);
 			domain_cost = t1 - t0;
+			/* 初始化每个sd的max_newidle_lb_cost */
 			update_newidle_cost(sd, domain_cost);
 
 			curr_cost += domain_cost;
@@ -12992,6 +13222,13 @@ static __latent_entropy void sched_balance_softirq(void)
 	 * load balance only within the local sched_domain hierarchy
 	 * and abort nohz_idle_balance altogether if we pull some load.
 	 */
+	/*
+	 * 如果有待处理的nohz idle balance，优先处理它，再做周期性均衡，因为nohz idle balance是一个全局的事情，
+	 * （代表所有idle CPU做均衡），而周期性均衡只是均衡自己的各阶sched domain。
+	 * 如果先执行this cpu均衡，也就是周期性均衡，那很有可能会拉取任务到本地的sched_domain（其它sched_domian的idle CPU无法参与），
+	 * 这样再执行nohz idle balance的时候，很可能就没有任务可以拉取了，所以优先处理nohz idle balance，
+	 * 是为了尽量让idle cpu有机会拉取到任务。
+	 */
 	if (nohz_idle_balance(this_rq, idle))
 		return;
 
@@ -13012,9 +13249,12 @@ void sched_balance_trigger(struct rq *rq)
 	if (unlikely(on_null_domain(rq) || !cpu_active(cpu_of(rq))))
 		return;
 
+	/* 并不是每次tick都会触发周期性负载均衡，需要等到next_balance时间点 */
 	if (time_after_eq(jiffies, rq->next_balance))
+		/* 触发周期性balance，periodic balance 或者叫做 tick balance */
 		raise_softirq(SCHED_SOFTIRQ);
 
+	/* 触发 nohz_idle_balance, IPI通知其它 */
 	nohz_balancer_kick(rq);
 }
 

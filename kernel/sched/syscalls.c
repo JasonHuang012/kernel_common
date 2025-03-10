@@ -26,9 +26,9 @@ static inline int __normal_prio(int policy, int rt_prio, int nice)
 	if (dl_policy(policy))
 		prio = MAX_DL_PRIO - 1;
 	else if (rt_policy(policy))
-		prio = MAX_RT_PRIO - 1 - rt_prio;
+		prio = MAX_RT_PRIO - 1 - rt_prio;	//实时进程的内核态优先级 = 99 - 用户态优先级
 	else
-		prio = NICE_TO_PRIO(nice);
+		prio = NICE_TO_PRIO(nice);		//普通进程 内核态优先级 = nice值 + 120
 
 	return prio;
 }

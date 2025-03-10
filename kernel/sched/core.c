@@ -1091,6 +1091,7 @@ void wake_up_q(struct wake_q_head *head)
  * might also involve a cross-CPU call to trigger the scheduler on
  * the target CPU.
  */
+/* 设置rq上正在运行的task被抢占 */
 void resched_curr(struct rq *rq)
 {
 	struct task_struct *curr = rq->curr;
@@ -1265,6 +1266,7 @@ static void nohz_csd_func(void *info)
 	rq->idle_balance = idle_cpu(cpu);
 	if (rq->idle_balance && !need_resched()) {
 		rq->nohz_idle_balance = flags;
+		/* 触发SCHED_SOFTIRQ软中断进行负载均衡: sched_balance_softirq->nohz_idle_balance */
 		raise_softirq_irqoff(SCHED_SOFTIRQ);
 	}
 }
@@ -8618,6 +8620,7 @@ void __init sched_init(void)
 		rq->last_blocked_load_update_tick = jiffies;
 		atomic_set(&rq->nohz_flags, 0);
 
+		/* 初始化nohz idle balance 处理函数, IPI中断唤醒后调用 */
 		INIT_CSD(&rq->nohz_csd, nohz_csd_func, rq);
 #endif
 #ifdef CONFIG_HOTPLUG_CPU

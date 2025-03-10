@@ -604,6 +604,7 @@ void kthread_set_per_cpu(struct task_struct *k, int cpu)
 }
 EXPORT_SYMBOL_GPL(kthread_set_per_cpu);
 
+/* 判断任务是否为percpu task */
 bool kthread_is_per_cpu(struct task_struct *p)
 {
 	struct kthread *kthread = __to_kthread(p);

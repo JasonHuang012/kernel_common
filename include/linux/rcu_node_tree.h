@@ -51,18 +51,19 @@
 #define RCU_FANOUT_3	      (RCU_FANOUT_2 * RCU_FANOUT)
 #define RCU_FANOUT_4	      (RCU_FANOUT_3 * RCU_FANOUT)
 
-#if NR_CPUS <= RCU_FANOUT_1
-#  define RCU_NUM_LVLS	      1
+#if NR_CPUS <= RCU_FANOUT_1	// <= 16
+#  define RCU_NUM_LVLS	      1	//层级
 #  define NUM_RCU_LVL_0	      1
-#  define NUM_RCU_NODES	      NUM_RCU_LVL_0
+#  define NUM_RCU_NODES	      NUM_RCU_LVL_0 //1，两个rcu_node
 #  define NUM_RCU_LVL_INIT    { NUM_RCU_LVL_0 }
 #  define RCU_NODE_NAME_INIT  { "rcu_node_0" }
 #  define RCU_FQS_NAME_INIT   { "rcu_node_fqs_0" }
-#elif NR_CPUS <= RCU_FANOUT_2
-#  define RCU_NUM_LVLS	      2
+#elif NR_CPUS <= RCU_FANOUT_2	// <= 16 * 64
+#  define RCU_NUM_LVLS	      2	//层级
 #  define NUM_RCU_LVL_0	      1
-#  define NUM_RCU_LVL_1	      DIV_ROUND_UP(NR_CPUS, RCU_FANOUT_1)
-#  define NUM_RCU_NODES	      (NUM_RCU_LVL_0 + NUM_RCU_LVL_1)
+/* 假如有36个cpu */
+#  define NUM_RCU_LVL_1	      DIV_ROUND_UP(NR_CPUS, RCU_FANOUT_1) // 36/16，向上取整，为3
+#  define NUM_RCU_NODES	      (NUM_RCU_LVL_0 + NUM_RCU_LVL_1)	//3，4个rcu_node
 #  define NUM_RCU_LVL_INIT    { NUM_RCU_LVL_0, NUM_RCU_LVL_1 }
 #  define RCU_NODE_NAME_INIT  { "rcu_node_0", "rcu_node_1" }
 #  define RCU_FQS_NAME_INIT   { "rcu_node_fqs_0", "rcu_node_fqs_1" }

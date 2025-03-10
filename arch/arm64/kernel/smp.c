@@ -958,6 +958,7 @@ void kgdb_roundup_cpus(void)
 /*
  * Main handler for inter-processor interrupts
  */
+/* arm64 IPI中断处理函数 */
 static void do_handle_IPI(int ipinr)
 {
 	unsigned int cpu = smp_processor_id();

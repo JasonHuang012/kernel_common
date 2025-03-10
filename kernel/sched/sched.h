@@ -1348,6 +1348,7 @@ static inline bool is_migration_disabled(struct task_struct *p)
 
 DECLARE_PER_CPU_SHARED_ALIGNED(struct rq, runqueues);
 
+/* 获取cpu的rq */
 #define cpu_rq(cpu)		(&per_cpu(runqueues, (cpu)))
 #define this_rq()		this_cpu_ptr(&runqueues)
 #define task_rq(p)		cpu_rq(task_cpu(p))
@@ -2048,11 +2049,15 @@ struct sched_group_capacity {
 };
 
 struct sched_group {
+	/* sched domain的所有sched group形成环形链表，next指向下一个调度组 */
 	struct sched_group	*next;			/* Must be a circular list */
+	/* 该调度组的引用计数 */
 	atomic_t		ref;
 
+	/* 当前调度组有多少个cpu */
 	unsigned int		group_weight;
 	unsigned int		cores;
+	/* 当前调度组的算力情况 */
 	struct sched_group_capacity *sgc;
 	int			asym_prefer_cpu;	/* CPU of highest priority in group */
 	int			flags;
@@ -2064,6 +2069,7 @@ struct sched_group {
 	 * by attaching extra space to the end of the structure,
 	 * depending on how many CPUs the kernel has booted up with)
 	 */
+	/* 当前调度组包含了哪些cpu */
 	unsigned long		cpumask[];
 };
 

@@ -1476,6 +1476,7 @@ config SCHED_CLUSTER
 	  by sharing mid-level caches, last-level cache tags or internal
 	  busses.
 
+# 减少多线程调度带来的开销
 config SCHED_SMT
 	bool "SMT scheduler support"
 	help
