@@ -866,6 +866,7 @@ EXPORT_SYMBOL_GPL(sched_setscheduler_nocheck);
  * The administrator _MUST_ configure the system, the kernel simply doesn't
  * know enough information to make a sensible choice.
  */
+/* 设置线程为fifo线程，并且优先级设置为中间值，即50  */
 void sched_set_fifo(struct task_struct *p)
 {
 	struct sched_param sp = { .sched_priority = MAX_RT_PRIO / 2 };
@@ -875,6 +876,11 @@ EXPORT_SYMBOL_GPL(sched_set_fifo);
 
 /*
  * For when you don't much care about FIFO, but want to be above SCHED_NORMAL.
+ */
+/*
+ * 设置线程为fifo线程，并且优先级设置为最低，即1
+ * 这里还是站在用户的角度来设置，所以1是最低优先级、99是最高优先级
+ * 最后会走到__normal_prio转换为内核优先级(数值越小优先级越高)，也就是1是最高、99是最低
  */
 void sched_set_fifo_low(struct task_struct *p)
 {

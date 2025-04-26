@@ -195,6 +195,7 @@
  * This macro does strict typechecking of @lo/@hi to make sure they are of the
  * same type as @val.  See the unnecessary pointer comparisons.
  */
+// 限制val的数值在lo和hi之间，如果小于lo则返回lo，如果大于hi则返回hi，在这之间则返回原来的值
 #define clamp(val, lo, hi) __careful_clamp(val, lo, hi)
 
 /*

@@ -651,8 +651,9 @@ struct balance_callback {
 };
 
 /* CFS-related fields in a runqueue */
+/* 待研究 */
 struct cfs_rq {
-	struct load_weight	load;
+	struct load_weight	load;	/* 运行队列所有调度实体的总负载 */
 	unsigned int		nr_running;
 	unsigned int		h_nr_running;      /* SCHED_{NORMAL,BATCH,IDLE} */
 	unsigned int		idle_nr_running;   /* SCHED_IDLE */
@@ -800,26 +801,33 @@ static inline int rt_bandwidth_enabled(void)
 
 /* Real-Time classes' related field in a runqueue: */
 struct rt_rq {
+	/* 表示优先级队列，100个优先级的链表，并定义了位图，用于快速查询 */
 	struct rt_prio_array	active;
 	unsigned int		rt_nr_running;
 	unsigned int		rr_nr_running;
 #if defined CONFIG_SMP || defined CONFIG_RT_GROUP_SCHED
 	struct {
+		/* 当前rt任务的最高优先级 */
 		int		curr; /* highest queued rt task prio */
 #ifdef CONFIG_SMP
+		/* 第二高的任务优先级 */
 		int		next; /* next highest */
 #endif
 	} highest_prio;
 #endif
 #ifdef CONFIG_SMP
+	/* 表示rt运行队列是否过载，如果过载，则将任务推送到其它CPU */
 	bool			overloaded;
+
+	/* 优先级列表，用于推送过载任务 */
 	struct plist_head	pushable_tasks;
 
 #endif /* CONFIG_SMP */
+	/* 表示rt运行队列已经加入到了rq队列中 */
 	int			rt_queued;
 
 #ifdef CONFIG_RT_GROUP_SCHED
-	int			rt_throttled;
+	int			rt_throttled;	/* 用于限流操作 */
 	u64			rt_time;
 	u64			rt_runtime;
 	/* Nests inside the rq lock: */
@@ -1102,6 +1110,7 @@ DECLARE_STATIC_KEY_FALSE(sched_uclamp_used);
  * (such as the load balancing or the thread migration code), lock
  * acquire operations must be ordered by ascending &runqueue.
  */
+/* 待研究 */
 struct rq {
 	/* runqueue lock: */
 	raw_spinlock_t		__lock;

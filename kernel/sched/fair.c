@@ -6951,6 +6951,7 @@ static inline void check_update_overutilized_status(struct rq *rq) { }
 /* Runqueue only has SCHED_IDLE tasks enqueued */
 static int sched_idle_rq(struct rq *rq)
 {
+	/* 如果队列中只有SCHED_IDLE调度实体的任务，并且不为0，表示当前cpu为idle状态 */
 	return unlikely(rq->nr_running == rq->cfs.idle_h_nr_running &&
 			rq->nr_running);
 }
@@ -7268,12 +7269,21 @@ static DEFINE_PER_CPU(cpumask_var_t, should_we_balance_tmpmask);
 
 #ifdef CONFIG_NO_HZ_COMMON
 
+/*
+ * nohz全局变量保存了nohz balance相关信息
+ * 用于控制nohz idle balance的频次，减少其带来的开销
+ * 开销包括：IPI中断、唤醒CPU等
+ */
 static struct {
-	cpumask_var_t idle_cpus_mask;
-	atomic_t nr_cpus;
+	cpumask_var_t idle_cpus_mask;	/* 记录进入idle的cpu */
+	atomic_t nr_cpus;		/* 记录进入idle的cpu个数 */
+	/* 这些进入idle的cpu是否需要更新blocked load */
 	int has_blocked;		/* Idle CPUS has blocked load */
+	/* 是否需要更新next_balance */
 	int needs_update;		/* Newly idle CPUs need their next_balance collated */
+	/* 下一次触发nohz idle balance的时间 */
 	unsigned long next_balance;     /* in jiffy units */
+	/* 下一次更新blocked load的时间点 */
 	unsigned long next_blocked;	/* Next update of blocked load in jiffies */
 } nohz ____cacheline_aligned;
 
@@ -11857,11 +11867,11 @@ static int should_we_balance(struct lb_env *env)
 	->sched_balance_trigger
 		-> raise_softirq(SCHED_SOFTIRQ);
 			-> sched_balance_softirq
-				-> (1) nohz_idle_balance				//nohz idle balancer，拉取任务到已经进入idle的CPU
+				-> (1) nohz_idle_balance			//**nohz idle balancer**，拉取任务到已经进入idle的CPU
 					-> _nohz_idle_balance
 						-> sched_balance_domains(rq, CPU_IDLE);
 							-> sched_balance_rq
-				-> (2) sched_balance_domains(this_rq, idle);	//periodic balancer，周期性balance
+				-> (2) sched_balance_domains(this_rq, idle);	//**periodic balancer**，周期性balance
 					-> sched_balance_rq
 		-> nohz_balancer_kick(rq);
 			->kick_ilb
@@ -11870,7 +11880,7 @@ static int should_we_balance(struct lb_env *env)
  * pick_next_task (cfs fair)
 	->__pick_next_task_fair
 		->pick_next_task_fair
-			->sched_balance_newidle  (如果pick不到task)		//newidle balancer，CPU即将进入idle时发生
+			->sched_balance_newidle  (如果pick不到task)		//**newidle balancer**，CPU即将进入idle时发生
 				->sched_balance_rq
 
  * 负载均衡的三种类型
@@ -11885,8 +11895,8 @@ static int should_we_balance(struct lb_env *env)
 			    那直接使用periodic balancer就可以完成负载均衡了，不需要其它CPU通过IPI唤醒。和周期性负载均衡一样，nohz idle
 			    balancer也是通过busy CPU的tick驱动的， nohz_balancer_kick会通过GIC发送一个IPI中断给选中的idle CPU，让它代表
 			    系统所有的idle CPU进行负载均衡，nohz idle balance也是自底向上均衡的。
-			    nohz idle balance本质上也是另一种周期性均衡负载，只是因为本CPU进入了idle，无法产生tick，因此让能长生tick的
-			    busy CPU来帮忙粗发tick balance。最后也都是通过sched_balance_domains函数来处理。
+			    nohz idle balance本质上也是另一种周期性均衡负载，只是因为本CPU进入了idle，无法产生tick，因此让能产生tick的
+			    busy CPU来帮忙触发tick balance。最后也都是通过sched_balance_domains函数来处理。
  */
 static int sched_balance_rq(int this_cpu, struct rq *this_rq,
 			struct sched_domain *sd, enum cpu_idle_type idle,
@@ -11977,6 +11987,7 @@ more_balance:
 		 * balance可能会有多轮
 		 * cur_ld_moved: 本次均衡中一轮balance操作迁移出来的task数量
 		 * ld_moved: 本次均衡中多轮balance操作累计迁移出来的task总数量
+		 * detach_tasks->can_migrate_task里面可能会选择新的dst_cpu, new_dst_cpu
 		 */
 		cur_ld_moved = detach_tasks(&env);
 
@@ -12171,6 +12182,7 @@ more_balance:
 
 	if (likely(!active_balance) || need_active_balance(&env)) {
 		/* We were unbalanced, so reset the balancing interval */
+		/* balance_interval 从min_interval开始 */
 		sd->balance_interval = sd->min_interval;
 	}
 
@@ -12230,6 +12242,17 @@ get_sd_balance_interval(struct sched_domain *sd, int cpu_busy)
 {
 	unsigned long interval = sd->balance_interval;
 
+	/*
+	 * 待进一步理解：
+	 * balance_interval是均衡时间间隔的基础值，会不断跟随sd的不均衡程度而变化。
+	 * 初始值从min_interval开始，如果sd仍处于不均衡状态(当前cpu为idle?)，则balance_interval仍保持min_interval
+	 * 随着不均衡状态变化，无runnable的任务可以迁移，则需要通过主动迁移(迁移正在运行的任务)来完成均衡,
+	 * 这时候balance_interval会逐渐变大，从而让均衡的时间间隔变大，知道max_interval。
+	 *
+	 * 待进一步确认：
+	 * 对于一个4+4的手机平台，在MC domain上，小核和大核cluster的min_interval都是4ms，而max_interval等于8ms。
+	 * 而在DIE domain层级上，由于CPU个数是8，其min_interval是8ms，而max_interval等于16ms。
+	 */
 	if (cpu_busy)
 		interval *= sd->busy_factor;
 
@@ -12241,9 +12264,17 @@ get_sd_balance_interval(struct sched_domain *sd, int cpu_busy)
 	 * balancing at lower domains by preventing their balancing periods
 	 * from being multiples of each other.
 	 */
+	/*
+	 * 由于每个cpu的tick差不多都是同时到来，因此而下而上的周期性均衡在各个cpu上几乎是同时出发的。
+	 * 如果sd覆盖越多的cpu，那它的均衡就需要收集更多的信息而导致均衡稍微慢一些，导致出现一种现象:
+	 *	低阶sd刚刚完成迁移的任务，会被高阶的sd选中而被拉到其它cpu上去
+	 * 为了降低这种低阶和高阶的均衡同步效应，把均衡间隔减去1jiffies，使得高阶sd和低阶sd的interval
+	 * 不是整数倍的关系，减少高低阶sd均衡竞争。
+	 */
 	if (cpu_busy)
 		interval -= 1;
 
+	/* 限制interval在1和max_load_balance_interval之间，最大不超过100ms */
 	interval = clamp(interval, 1UL, max_load_balance_interval);
 
 	return interval;
@@ -12407,6 +12438,7 @@ static inline bool update_newidle_cost(struct sched_domain *sd, u64 cost)
 static void sched_balance_domains(struct rq *rq, enum cpu_idle_type idle)
 {
 	int continue_balancing = 1;
+	/* 获取当前cpu */
 	int cpu = rq->cpu;
 	int busy = idle != CPU_IDLE && !sched_idle_cpu(cpu);
 	unsigned long interval;
@@ -12444,9 +12476,6 @@ static void sched_balance_domains(struct rq *rq, enum cpu_idle_type idle)
 		 * actively.
 		 */
 		/*
-		 *
-		 */
-		/*
 		 * continue_balancing用于控制是否继续进行负载均衡
 		 * 不需要均衡 且 不需要衰减，则跳出循环，退出均衡
 		 */
@@ -12462,6 +12491,7 @@ static void sched_balance_domains(struct rq *rq, enum cpu_idle_type idle)
 			break;
 		}
 
+		/* 根据cpu busy情况/不均衡程度，延长balance_interval */
 		interval = get_sd_balance_interval(sd, busy);
 
 		need_serialize = sd->flags & SD_SERIALIZE;
@@ -12470,6 +12500,7 @@ static void sched_balance_domains(struct rq *rq, enum cpu_idle_type idle)
 				goto out;
 		}
 
+		/* 如果当前时刻达到下次均衡时间 */
 		if (time_after_eq(jiffies, sd->last_balance + interval)) {
 			if (sched_balance_rq(cpu, rq, sd, idle, &continue_balancing)) {
 				/*
@@ -12477,15 +12508,21 @@ static void sched_balance_domains(struct rq *rq, enum cpu_idle_type idle)
 				 * env->dst_cpu, so we can't know our idle
 				 * state even if we migrated tasks. Update it.
 				 */
+				/*
+				 * 如果完成了一轮均衡，迁移了一些任务，则需要重新判断this cpu的busy状态
+				 * 也可能重新选择了dst_cpu，任务被迁移到新的dst_cpu中
+				 */
 				idle = idle_cpu(cpu);
 				busy = !idle && !sched_idle_cpu(cpu);
 			}
 			sd->last_balance = jiffies;
+			/* 重新获取均衡时间间隔 */
 			interval = get_sd_balance_interval(sd, busy);
 		}
 		if (need_serialize)
 			atomic_set_release(&sched_balance_running, 0);
 out:
+		/* 如果next_balance > sd->last_balance + interval */
 		if (time_after(next_balance, sd->last_balance + interval)) {
 			next_balance = sd->last_balance + interval;
 			update_next_balance = 1;
@@ -12496,7 +12533,9 @@ out:
 		 * Ensure the rq-wide value also decays but keep it at a
 		 * reasonable floor to avoid funnies with rq->avg_idle.
 		 */
-		/* 需要把衰减过的max_newidle_lb_cost更新到rq->max_idle_balance_cost中 */
+		/* 如果上面有任意一个level的domia做了衰减
+		 * 则需要把衰减过的max_newidle_lb_cost更新到rq->max_idle_balance_cost中断唤醒
+		 */
 		rq->max_idle_balance_cost =
 			max((u64)sysctl_sched_migration_cost, max_cost);
 	}
@@ -12507,6 +12546,7 @@ out:
 	 * When the cpu is attached to null domain for ex, it will not be
 	 * updated.
 	 */
+	/* 更新sd->next_balance */
 	if (likely(update_next_balance))
 		rq->next_balance = next_balance;
 
@@ -12618,6 +12658,7 @@ static void nohz_balancer_kick(struct rq *rq)
 	unsigned int flags = 0;
 	int done = 0;
 
+	/* 触发nohz balance是因为当前cpu繁忙需要其它idle cpu来分担任务，如果当前cpu是空闲的，则没必要触发nohz balance了  */
 	if (unlikely(rq->idle_balance))
 		return;
 
@@ -12625,19 +12666,32 @@ static void nohz_balancer_kick(struct rq *rq)
 	 * We may be recently in ticked or tickless idle mode. At the first
 	 * busy tick after returning from idle, we will update the busy stats.
 	 */
+	/* 退出idle进行nohz balance时
+	 * 1.需要更新全局变量nohz, 包括idle cpu个数-1、idle_cpus_mask
+	 * 2.sd的nohz_idle改为0、增加busy cpu个数
+	 */
 	nohz_balance_exit_idle(rq);
 
 	/*
 	 * None are in tickless mode and hence no need for NOHZ idle load
 	 * balancing:
 	 */
+	/* 没有idle cpu, 则不进行nohz idle balance */
 	if (likely(!atomic_read(&nohz.nr_cpus)))
 		return;
 
+	/* 如果需要更新blocked load, 则设置相关标记, 什么是blocked load, 待研究 */
 	if (READ_ONCE(nohz.has_blocked) &&
 	    time_after(now, READ_ONCE(nohz.next_blocked)))
 		flags = NOHZ_STATS_KICK;
 
+	/*
+	 *  nohz.nex_balance用来控制nohz idle balance的触发时间，这个触发时间点和系统中所有idle cpu的rq->next_balance有关
+	 * 比如系统中所有的idle cpu都还没到达要均衡的时间点，则也不需要触发nohz idle balance了
+	 * 也就是rq->next_balance的优先级大于nohz.next_balance
+	 *
+	 * 在执行nohz idle balance时，调度器实际上会遍历idle cpu找到最小的rq->next_balance赋值给nohz.next_balance
+	 */
 	if (time_before(now, nohz.next_balance))
 		goto out;
 
@@ -12645,6 +12699,7 @@ static void nohz_balancer_kick(struct rq *rq)
 	if (done)
 		goto out;
 
+	/* 需要保证本地有足够多的任务可以被拉取到idle cpu，才能进行nohz idle balance */
 	if (rq->nr_running >= 2) {
 		flags = NOHZ_STATS_KICK | NOHZ_BALANCE_KICK;
 		goto out;
@@ -12657,6 +12712,10 @@ static void nohz_balancer_kick(struct rq *rq)
 		/*
 		 * If there's a runnable CFS task and the current CPU has reduced
 		 * capacity, kick the ILB to see if there's a better CPU to run on:
+		 */
+		/*
+		 * 如果本地cpu rq上至少有一个任务，但当前cpu可用于cfs任务的算力已经衰减
+		 * 到一定程度（由于rt任务或者irq等的影响），这时候也需要发起nohz idle balance
 		 */
 		if (rq->cfs.h_nr_running >= 1 && check_cpu_capacity(rq, sd)) {
 			flags = NOHZ_STATS_KICK | NOHZ_BALANCE_KICK;
@@ -12741,6 +12800,7 @@ static void set_cpu_sd_state_busy(int cpu)
 		goto unlock;
 	sd->nohz_idle = 0;
 
+	/* 增加busy cpu个数 */
 	atomic_inc(&sd->shared->nr_busy_cpus);
 unlock:
 	rcu_read_unlock();

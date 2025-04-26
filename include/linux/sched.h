@@ -540,32 +540,73 @@ struct sched_statistics {
 #endif /* CONFIG_SCHEDSTATS */
 } ____cacheline_aligned;
 
+/*
+ * 调度实体代表了一个调度对象，可以使一个进程，也可以是一个进程组
+ */
 struct sched_entity {
 	/* For load-balancing: */
+	/*
+	 * 表示当前调度实体的权重，用于决定调度实体的运行优先级
+	 * 对进程实体而言，权重由静态优先级计算得到；对进程组，则是组内各个进程的load之和
+	 * load表示权重，而cpu_load表示负载
+	 */
 	struct load_weight		load;
+	/*
+	 * 红黑树的数据节点，使用该rb_node将当前节点挂到红黑树上面
+	 * 将红黑树节点嵌入se结构体中，在操作节点时可以通过rb_node反向获取到其父结构
+	 */
 	struct rb_node			run_node;
 	u64				deadline;
 	u64				min_vruntime;
 	u64				min_slice;
 
+	/*
+	 * 链表节点，被链接到percpu的rq->cfs_tasks上
+	 * 在做cpu之间的负载均衡时，会从该链表上选出group_node节点作为迁移进程
+	 */
 	struct list_head		group_node;
+	/*
+	 * 表示当前调度实体是否在cfs_rq就绪队列上
+	 *
+	 *
+	 */
 	unsigned char			on_rq;
 	unsigned char			sched_delayed;
 	unsigned char			rel_deadline;
 	unsigned char			custom_slice;
 					/* hole */
 
+	/* 当前实体上次被调度执行的时间点 */
 	u64				exec_start;
+	/* 当前实体总的执行时间 */
 	u64				sum_exec_runtime;
+	/*
+	 * 截止到上次统计，进程执行的时间，用于计算出本次执行的时间
+	 * sum_exec_runtime - prev_sum_exec_runtime = 本次执行时间，用于某些时间相关的操作
+	 */
 	u64				prev_sum_exec_runtime;
+	/*
+	 * 当前实体的虚拟运行时间，调度器就是通过实体的虚拟时间进行调度
+	 * 在选择笑一个执行实体时，总是选择虚拟时间最小的
+	 */
 	u64				vruntime;
 	s64				vlag;
 	u64				slice;
 
+	/*
+	 * 调度实体的迁移次数
+	 * 在多核系统中，CPU之间经常进行负载均衡，因此调度实体很可能因为堵在均衡而被迁移到其它cpu上
+	 */
 	u64				nr_migrations;
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
+	/*
+	 * 当前调度实体的调度组深度
+	 * 由于调度实体可能是调度组，调度组中存在嵌套的调度实体
+	 * 这个成员表示的当前实体属于调度组中的深度，当为0时，表示实体不属于调度组
+	 */
 	int				depth;
+	/* 执行父级调度实体 */
 	struct sched_entity		*parent;
 	/* rq on which this entity is (to be) queued: */
 	struct cfs_rq			*cfs_rq;
@@ -587,20 +628,20 @@ struct sched_entity {
 };
 
 struct sched_rt_entity {
-	struct list_head		run_list;
-	unsigned long			timeout;
-	unsigned long			watchdog_stamp;
-	unsigned int			time_slice;
+	struct list_head		run_list;	/* 用于将实时调度实体加入到优先级队列中 */
+	unsigned long			timeout;	/* 用于设置调度超时时间 */
+	unsigned long			watchdog_stamp; /* 用于记录jiffies的值 */
+	unsigned int			time_slice;	/* 时间片 */
 	unsigned short			on_rq;
 	unsigned short			on_list;
 
-	struct sched_rt_entity		*back;
+	struct sched_rt_entity		*back;		/* 用于由上到下连接实时调度实体 */
 #ifdef CONFIG_RT_GROUP_SCHED
-	struct sched_rt_entity		*parent;
+	struct sched_rt_entity		*parent;	/* 指向父类实时调度实体 */
 	/* rq on which this entity is (to be) queued: */
-	struct rt_rq			*rt_rq;
+	struct rt_rq			*rt_rq;		/* 表示当前实时调度实体所属的实时运行队列 */
 	/* rq "owned" by this entity/group: */
-	struct rt_rq			*my_q;
+	struct rt_rq			*my_q;		/* 表示当前实时调度实体所拥有的实时运行队列，用于管理子任务 */
 #endif
 } __randomize_layout;
 
@@ -863,6 +904,10 @@ struct task_struct {
 	struct uclamp_se		uclamp[UCLAMP_CNT];
 #endif
 
+	/*
+	 * 进行的属性统计，需要配置CONIG_SCHEDSTATS
+	 * 包括睡眠统计、等待延迟统计、CPU迁移统计、唤醒统计等等
+	 */
 	struct sched_statistics         stats;
 
 #ifdef CONFIG_PREEMPT_NOTIFIERS

@@ -100,7 +100,7 @@ struct sched_domain {
 	/* 检查负载均衡的最小时间间隔，太长时间不检查会导致负载差异过大 */
 	unsigned long max_interval;	/* Maximum balance interval ms */
 	/*
-	 * 反应cpu忙碌程度的参数，系统会根据实际运行情况动态调整cpu负载均衡的时间间隔，该值记录在balance_interval字段中
+	 * 反映cpu忙碌程度的参数，系统会根据实际运行情况动态调整cpu负载均衡的时间间隔，该值记录在balance_interval字段中
 	 * 如果cpu很繁忙，时间间隔就适当延长一点: busy_factor * balance_interval
 	 */
 	unsigned int busy_factor;	/* less balancing by factor if busy */
@@ -110,6 +110,11 @@ struct sched_domain {
 	unsigned int cache_nice_tries;	/* Leave cache hot tasks for # tries */
 	unsigned int imb_numa_nr;	/* Nr running tasks that allows a NUMA imbalance */
 
+	/*
+	 * nohz idle状态
+	 * 1表示进入nohz idle
+	 * 0表示退出idle，比如从nohz idle状态退出进行nohz idle balance_interval
+	 */
 	int nohz_idle;			/* NOHZ IDLE status */
 	int flags;			/* See SD_* */
 	/* 当前调度域在整个调度层级结构中的level,比如base调度域的level为0，向上依次加1,可以理解为调度域在树中的高度 */

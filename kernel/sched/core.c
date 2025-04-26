@@ -1300,6 +1300,7 @@ bool sched_can_stop_tick(struct rq *rq)
 	 * If there are more than one RR tasks, we need the tick to affect the
 	 * actual RR behaviour.
 	 */
+	 sched_set_fifo
 	if (rq->rt.rr_nr_running) {
 		if (rq->rt.rr_nr_running == 1)
 			return true;

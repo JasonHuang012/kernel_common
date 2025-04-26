@@ -1589,6 +1589,7 @@ static struct cpumask		***sched_domains_numa_masks;
 	 SD_NUMA		|	\
 	 SD_ASYM_PACKING)
 
+/* sd_init, 待研究 */
 static struct sched_domain *
 sd_init(struct sched_domain_topology_level *tl,
 	const struct cpumask *cpu_map,
@@ -1606,6 +1607,7 @@ sd_init(struct sched_domain_topology_level *tl,
 	sched_domains_curr_level = tl->numa_level;
 #endif
 
+	/* 根据cpu的个数， */
 	sd_weight = cpumask_weight(tl->mask(cpu));
 
 	if (tl->sd_flags)
@@ -1615,8 +1617,8 @@ sd_init(struct sched_domain_topology_level *tl,
 		sd_flags &= TOPOLOGY_SD_FLAGS;
 
 	*sd = (struct sched_domain){
-		.min_interval		= sd_weight,
-		.max_interval		= 2*sd_weight,
+		.min_interval		= sd_weight,	/* min_interval初始化，单位为ms */
+		.max_interval		= 2*sd_weight,	/* max_interval初始化，为两倍min_interval */
 		.busy_factor		= 16,
 		.imbalance_pct		= 117,
 
