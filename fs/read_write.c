@@ -733,6 +733,7 @@ ssize_t ksys_write(unsigned int fd, const char __user *buf, size_t count)
 			pos = *ppos;
 			ppos = &pos;
 		}
+		//pr_info("%s: comm %s, fd %d, start %lld, end %lld, size %d\n", __func__, current->comm, fd, pos, pos + count, count);
 		ret = vfs_write(fd_file(f), buf, count, ppos);
 		if (ret >= 0 && ppos)
 			fd_file(f)->f_pos = pos;
@@ -1059,6 +1060,9 @@ static ssize_t vfs_writev(struct file *file, const struct iovec __user *vec,
 	if (ret < 0)
 		goto out;
 
+	//pr_info("%s: comm %s, start %lld, end %lld, size %ld", __func__, current->comm, *pos, *pos + tot_len, tot_len);
+	// or this one, but should be called after import_iovec()，return value from import_iovec is total len
+	//pr_info("%s: comm %s, start %lld, end %lld, size %ld", __func__, current->comm, *pos, *pos + ret, ret);
 	file_start_write(file);
 	if (file->f_op->write_iter)
 		ret = do_iter_readv_writev(file, &iter, pos, WRITE, flags);
@@ -1102,6 +1106,7 @@ static ssize_t do_writev(unsigned long fd, const struct iovec __user *vec,
 	struct fd f = fdget_pos(fd);
 	ssize_t ret = -EBADF;
 
+	//pr_info("%s: comm %s, fd %d\n", __func__, current->comm, fd);
 	if (fd_file(f)) {
 		loff_t pos, *ppos = file_ppos(fd_file(f));
 		if (ppos) {

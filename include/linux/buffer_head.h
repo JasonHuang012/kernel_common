@@ -64,6 +64,7 @@ struct buffer_head {
 		struct folio *b_folio;	/* the folio this bh is mapped to */
 	};
 
+	// 磁盘物理块号
 	sector_t b_blocknr;		/* start block number */
 	size_t b_size;			/* size of mapping */
 	char *b_data;			/* pointer to data within the page */

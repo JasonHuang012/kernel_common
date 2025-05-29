@@ -346,29 +346,47 @@ static inline int fat_ent_update_ptr(struct super_block *sb,
 	return 1;
 }
 
+/*
+ * 获取对应cluster的fat表项，成功返回fat项值，也即是下一个物理簇号
+ * 分三步：
+ *	1．算出文件cluster在FAT表中对应的位置，ent_blocknr完成
+ *	2．读出FAT表中的内容，ent_bread完成
+ *	3．获得对应的磁盘cluster，ent_get完成, fat32_ent_get
+ */
 int fat_ent_read(struct inode *inode, struct fat_entry *fatent, int entry)
 {
 	struct super_block *sb = inode->i_sb;
-	struct msdos_sb_info *sbi = MSDOS_SB(inode->i_sb);
+	struct msdos_sb_info *sbi = MSDOS_SB(inode->i_sb)
 	const struct fatent_operations *ops = sbi->fatent_ops;
 	int err, offset;
 	sector_t blocknr;
 
+	/* 判断data物理簇号是否有效 */
 	if (!fat_valid_entry(sbi, entry)) {
 		fatent_brelse(fatent);
+		/*
+		 * 无效的fat条目（无法的物理簇号），可能的原因:
+		 *	1.物理簇号指向保留区域；
+		 *	2.物理簇号超过fat表范围；
+		*	3.fat表损坏
+		 */
 		fat_fs_error(sb, "invalid access to FAT (entry 0x%08x)", entry);
 		return -EIO;
 	}
 
+	/* 配置当前fat条目的值, fatent->entry为当前物理簇号 */
 	fatent_set_entry(fatent, entry);
 	ops->ent_blocknr(sb, entry, &offset, &blocknr);
 
+	/* 更新fat条目指针 */
 	if (!fat_ent_update_ptr(sb, fatent, offset, blocknr)) {
 		fatent_brelse(fatent);
 		err = ops->ent_bread(sb, fatent, offset, blocknr);
 		if (err)
 			return err;
 	}
+
+	/* 获取fat条目值，也就是下一个物理簇号 */
 	return ops->ent_get(fatent);
 }
 
@@ -414,12 +432,15 @@ int fat_ent_write(struct inode *inode, struct fat_entry *fatent,
 	const struct fatent_operations *ops = MSDOS_SB(sb)->fatent_ops;
 	int err;
 
+	/* 将物理簇号保存到给定fat表项的链表指针, fat32_ent_put*/
 	ops->ent_put(fatent, new);
 	if (wait) {
+		/* 更新FAT表 */
 		err = fat_sync_bhs(fatent->bhs, fatent->nr_bhs);
 		if (err)
 			return err;
 	}
+	/* 更新FAT表镜像，也就是备份的FAT表 */
 	return fat_mirror_bhs(sb, fatent->bhs, fatent->nr_bhs);
 }
 
@@ -551,6 +572,10 @@ out:
 	return err;
 }
 
+/*
+ * 释放文件系统中的簇链
+ * cluster: 要释放的起始物理簇号
+ */
 int fat_free_clusters(struct inode *inode, int cluster)
 {
 	struct super_block *sb = inode->i_sb;
@@ -562,20 +587,25 @@ int fat_free_clusters(struct inode *inode, int cluster)
 	int first_cl = cluster, dirty_fsinfo = 0;
 
 	nr_bhs = 0;
-	fatent_init(&fatent);
-	lock_fat(sbi);
+	fatent_init(&fatent);	// 初始化FAT表项
+	lock_fat(sbi);		// 锁定FAT表，防止并发操作
 	do {
+		/* 获取fat表项内容，保存在fatent中，返回下一个物理簇号到cluster */
 		cluster = fat_ent_read(inode, &fatent, cluster);
 		if (cluster < 0) {
 			err = cluster;
 			goto error;
 		} else if (cluster == FAT_ENT_FREE) {
+			/*
+			 * 遍历fat表链，遇到空闲簇，说明fat表可能损坏了
+			 */
 			fat_fs_error(sb, "%s: deleting FAT entry beyond EOF",
 				     __func__);
 			err = -EIO;
 			goto error;
 		}
 
+		/* 如果使用了discard选项，则对释放的簇进行物理擦除 */
 		if (sbi->options.discard) {
 			/*
 			 * Issue discard for the sectors we no longer
@@ -585,6 +615,7 @@ int fat_free_clusters(struct inode *inode, int cluster)
 			if (cluster != fatent.entry + 1) {
 				int nr_clus = fatent.entry - first_cl + 1;
 
+				/* 批量发送discard命令 */
 				sb_issue_discard(sb,
 					fat_clus_to_blknr(sbi, first_cl),
 					nr_clus * sbi->sec_per_clus,
@@ -594,21 +625,26 @@ int fat_free_clusters(struct inode *inode, int cluster)
 			}
 		}
 
+		/* 将fat表项标记为空闲 */
 		ops->ent_put(&fatent, FAT_ENT_FREE);
 		if (sbi->free_clusters != -1) {
-			sbi->free_clusters++;
-			dirty_fsinfo = 1;
+			sbi->free_clusters++;	// 更新空闲簇数目
+			dirty_fsinfo = 1;	// 标记fsinfo需要更新
 		}
 
+		/* 如果缓存区满了，则需要同步写入 */
 		if (nr_bhs + fatent.nr_bhs > MAX_BUF_PER_PAGE) {
 			if (sb->s_flags & SB_SYNCHRONOUS) {
+				/* 同步缓存区到磁盘 */
 				err = fat_sync_bhs(bhs, nr_bhs);
 				if (err)
 					goto error;
 			}
+			/* 同步到fat镜像 */
 			err = fat_mirror_bhs(sb, bhs, nr_bhs);
 			if (err)
 				goto error;
+			/* 释放缓存区 */
 			for (i = 0; i < nr_bhs; i++)
 				brelse(bhs[i]);
 			nr_bhs = 0;
@@ -616,11 +652,13 @@ int fat_free_clusters(struct inode *inode, int cluster)
 		fat_collect_bhs(bhs, &nr_bhs, &fatent);
 	} while (cluster != FAT_ENT_EOF);
 
+	/* 处理剩余的缓存区 */
 	if (sb->s_flags & SB_SYNCHRONOUS) {
 		err = fat_sync_bhs(bhs, nr_bhs);
 		if (err)
 			goto error;
 	}
+	/* 更新FAT表镜像，释放cluster也需要更新备份FAT表 *//
 	err = fat_mirror_bhs(sb, bhs, nr_bhs);
 error:
 	fatent_brelse(&fatent);

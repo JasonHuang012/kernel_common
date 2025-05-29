@@ -1500,6 +1500,7 @@ static int write_inode(struct inode *inode, struct writeback_control *wbc)
 
 	if (inode->i_sb->s_op->write_inode && !is_bad_inode(inode)) {
 		trace_writeback_write_inode_start(inode, wbc);
+		/* 例如 fat_write_inode */
 		ret = inode->i_sb->s_op->write_inode(inode, wbc);
 		trace_writeback_write_inode(inode, wbc);
 		return ret;

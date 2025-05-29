@@ -487,6 +487,7 @@ int fat_search_long(struct inode *inode, const unsigned char *name,
 
 	err = -ENOENT;
 	while (1) {
+		/* 获取de */
 		if (fat_get_entry(inode, &cpos, &bh, &de) == -1)
 			goto end_of_dir;
 parse_record:
@@ -1340,6 +1341,7 @@ int fat_add_entries(struct inode *dir, void *slots, int nr_slots,
 
 found:
 	err = 0;
+	/* 获取空闲目录项的起始位置 */
 	pos -= free_slots * sizeof(*de);
 	nr_slots -= free_slots;
 	if (free_slots) {

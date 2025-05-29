@@ -251,6 +251,16 @@ out:
 }
 
 /*
+Linux fat fs预分配有两种方式
+int fallocate(int fd, int mode, off_t offset, off_t len);
+        1.参数mode带FALLOC_FL_KEEP_SIZE  : 分配磁盘空间、不会磁盘填充数据，速度快，文件size为0(后续写入时更新);
+        2.参数mode不带FALLOC_FL_KEEP_SIZE: 分配磁盘空间、会磁盘填充数据，速度慢，文件size为传入的len;
+
+产品采用了mode带FALLOC_FL_KEEP_SIZE的方式，且修改内核fat_fallocate接口、使得文件size为实际大小（应用需求）
+对应的改动见下面的CONFIG_PRODUCT
+*/
+
+/*
  * Preallocate space for a file. This implements fat's fallocate file
  * operation, which gets called from sys_fallocate system call. User
  * space requests len bytes at offset. If FALLOC_FL_KEEP_SIZE is set
@@ -287,12 +297,27 @@ static long fat_fallocate(struct file *file, int mode,
 		nr_cluster = (mm_bytes + (sbi->cluster_size - 1)) >>
 			sbi->cluster_bits;
 
+#ifndef CONFIG_PRODUCT
 		/* Start the allocation.We are not zeroing out the clusters */
 		while (nr_cluster-- > 0) {
 			err = fat_add_cluster(inode);
 			if (err)
 				goto error;
 		}
+#else
+		/* Start the allocation.We are not zeroing out the clusters */
+		while (nr_cluster-- > 0) {
+			err = fat_add_cluster(inode);
+			if (err)
+				goto error;
+			/* update the allocated size */
+			inode->i_size += sbi->cluster_size;
+		}
+		/* store the allocated size in the file entry of MS-DOS file system */
+		MSDOS_I(inode)->mmu_private = inode->i_size;
+		/* set inode dirty to make sure the lastest i_size will be updated to fat dentry */
+		mark_inode_dirty(inode);
+#endif
 	} else {
 		if ((offset + len) <= i_size_read(inode))
 			goto error;
@@ -306,21 +331,30 @@ error:
 	return err;
 }
 
+/*
+ * 用于释放（回收）某个文件/目录从第skip个簇之后的所有簇，
+ * 主要是在文件截断（如truncate）、删除文件时释放磁盘空间
+ * 如果skip为0，则全部释放；否则保留前skip个簇
+ */
 /* Free all clusters after the skip'th cluster. */
 static int fat_free(struct inode *inode, int skip)
 {
 	struct super_block *sb = inode->i_sb;
 	int err, wait, free_start, i_start, i_logstart;
 
+	/* 如果文件没有分配任何簇，直接返回 */
 	if (MSDOS_I(inode)->i_start == 0)
 		return 0;
 
+	/* 无效inode的FAT缓存，保证后续操作的正确性 */
 	fat_cache_inval_inode(inode);
 
+	/* 获取是否需要回写磁盘 */
 	wait = IS_DIRSYNC(inode);
 	i_start = free_start = MSDOS_I(inode)->i_start;
 	i_logstart = MSDOS_I(inode)->i_logstart;
 
+	/* 如果是全部释放，则先更新起始簇号为0 */
 	/* First, we write the new file size. */
 	if (!skip) {
 		MSDOS_I(inode)->i_start = 0;
@@ -329,49 +363,72 @@ static int fat_free(struct inode *inode, int skip)
 	MSDOS_I(inode)->i_attrs |= ATTR_ARCH;
 	fat_truncate_time(inode, NULL, S_CTIME|S_MTIME);
 	if (wait) {
+		/* 如果需要回写，则先将元数据写回磁盘 */
 		err = fat_sync_inode(inode);
 		if (err) {
+			/* 写回失败则恢复原始起始簇号，防止内存和磁盘状态不一致 */
 			MSDOS_I(inode)->i_start = i_start;
 			MSDOS_I(inode)->i_logstart = i_logstart;
 			return err;
 		}
 	} else
+		/* 如果不用回写，否则只标记inode为脏，稍后释放后统一写回磁盘 */
 		mark_inode_dirty(inode);
 
+	/*
+	 * 如果skip不为0，表示只释放部分簇链，需要在第skip-1个簇后写入新的EOF，
+	 * 并获取后续需要释放的簇链起始簇号。
+	 */
 	/* Write a new EOF, and get the remaining cluster chain for freeing. */
 	if (skip) {
 		struct fat_entry fatent;
 		int ret, fclus, dclus;
 
+		/* 获取第skip-1个簇对应的FAT表项 */
 		ret = fat_get_cluster(inode, skip - 1, &fclus, &dclus);
 		if (ret < 0)
 			return ret;
-		else if (ret == FAT_ENT_EOF)
+		else if (ret == FAT_ENT_EOF)	// 已经到达簇链末尾，无需释放
 			return 0;
 
+		/* 初始化FAT表项操作结构 */
 		fatent_init(&fatent);
+		/* 读取这个簇对应的FAT表项 */
 		ret = fat_ent_read(inode, &fatent, dclus);
-		if (ret == FAT_ENT_EOF) {
+		if (ret == FAT_ENT_EOF) {	// 已经是EOF，无需处理
 			fatent_brelse(&fatent);
 			return 0;
-		} else if (ret == FAT_ENT_FREE) {
+		} else if (ret == FAT_ENT_FREE) { // 遇到空闲簇，说明簇链损坏
+			/*
+			 * 正常情况下，文件的簇链应该是连续的、有效的，
+			 * 如果在遍历簇链是遇到空闲簇，则说明文件的簇链已经损坏了，可能的原因：
+			 *	1.FAT表损坏；
+			 *	2.链表断裂、簇被重新分配等；
+			 *	3.文件系统bug;
+			 */
 			fat_fs_error(sb,
 				     "%s: invalid cluster chain (i_pos %lld)",
 				     __func__, MSDOS_I(inode)->i_pos);
 			ret = -EIO;
 		} else if (ret > 0) {
+			/* 成功读取FAT表项后，将该簇的FAT表项写为EOF，截断簇链 */
 			err = fat_ent_write(inode, &fatent, FAT_ENT_EOF, wait);
 			if (err)
 				ret = err;
 		}
+		/* 释放FAT表项操作结构 */
 		fatent_brelse(&fatent);
 		if (ret < 0)
 			return ret;
 
+		/* 需要释放的簇链起始簇号 */
 		free_start = ret;
 	}
+
+	/* 更新文件大小，i_blocks，表示文件实际占用的块数 */
 	inode->i_blocks = skip << (MSDOS_SB(sb)->cluster_bits - 9);
 
+	/* 释放剩余的簇链（从free_start开始） */
 	/* Freeing the remained cluster chain */
 	return fat_free_clusters(inode, free_start);
 }

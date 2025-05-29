@@ -2083,29 +2083,102 @@ iomap_to_bh(struct inode *inode, sector_t block, struct buffer_head *bh,
 	}
 }
 
+/*
+write之后（应该是write小数据后，发起的读卡流程, 不同版本的内核）
+[  378.549183] CPU: 1 PID: 349 Comm: sd_write Tainted: P           O      5.10.106 git#26debb45
+[  378.557629] Hardware name: Generic DT based system
+[  378.562441] [<c02112cd>] (unwind_backtrace) from [<c020ee7f>] (show_stack+0xb/0xc)
+[  378.570026] [<c020ee7f>] (show_stack) from [<c0488abf>] (dump_stack+0x5f/0x74)
+[  378.577266] [<c0488abf>] (dump_stack) from [<c03cff05>] (sdhci_send_command+0x10d/0x150)
+[  378.585371] [<c03cff05>] (sdhci_send_command) from [<c03cff67>] (sdhci_send_command_retry+0x1f/0xa8)
+[  378.594518] [<c03cff67>] (sdhci_send_command_retry) from [<c03d00a1>] (sdhci_request+0xb1/0xc8)
+[  378.603232] [<c03d00a1>] (sdhci_request) from [<c03c0951>] (mmc_start_request+0x49/0x5c)
+[  378.611338] [<c03c0951>] (mmc_start_request) from [<c048b5e5>] (mmc_blk_mq_issue_rw_rq+0x55/0xa0)
+[  378.620228] [<c048b5e5>] (mmc_blk_mq_issue_rw_rq) from [<c03cc2e5>] (mmc_blk_mq_issue_rq+0x183/0x196)
+[  378.629464] [<c03cc2e5>] (mmc_blk_mq_issue_rq) from [<c03cc6e7>] (mmc_mq_queue_rq+0x105/0x156)
+[  378.638094] [<c03cc6e7>] (mmc_mq_queue_rq) from [<c03226fb>] (__blk_mq_try_issue_directly+0x87/0xd8)
+[  378.647242] [<c03226fb>] (__blk_mq_try_issue_directly) from [<c03238c7>] (blk_mq_try_issue_directly+0x33/0x6c)
+[  378.657258] [<c03238c7>] (blk_mq_try_issue_directly) from [<c0323d5d>] (blk_mq_submit_bio+0x1f3/0x21a)
+[  378.666582] [<c0323d5d>] (blk_mq_submit_bio) from [<c031d24b>] (submit_bio_noacct+0x5b/0x9c)
+[  378.675036] [<c031d24b>] (submit_bio_noacct) from [<c02af2df>] (submit_bh_wbc.constprop.0+0xcb/0xd8)
+[  378.684184] [<c02af2df>] (submit_bh_wbc.constprop.0) from [<c02af9e9>] (ll_rw_block+0x4d/0x6c)
+[  378.692813] [<c02af9e9>] (ll_rw_block) from [<c02b1119>] (__block_write_begin_int+0x1bd/0x1ec)
+[  378.701442] [<c02b1119>] (__block_write_begin_int) from [<c02b115b>] (__block_write_begin+0x13/0x18)
+[  378.710591] [<c02b115b>] (__block_write_begin) from [<c02b1187>] (block_write_begin+0x27/0x48)
+[  378.719220] [<c02b1187>] (block_write_begin) from [<c02dc309>] (fat_write_begin+0x33/0x52)
+[  378.727501] [<c02dc309>] (fat_write_begin) from [<c02674f7>] (generic_perform_write+0x7f/0x122)
+[  378.736217] [<c02674f7>] (generic_perform_write) from [<c026885b>] (__generic_file_write_iter+0x51/0x122)
+[  378.745800] [<c026885b>] (__generic_file_write_iter) from [<c0268959>] (generic_file_write_iter+0x2d/0x70)
+[  378.755470] [<c0268959>] (generic_file_write_iter) from [<c028feaf>] (vfs_write+0xe3/0x12c)
+[  378.763835] [<c028feaf>] (vfs_write) from [<c028ffbd>] (ksys_write+0x49/0x78)
+[  378.770983] [<c028ffbd>] (ksys_write) from [<c0208221>] (ret_fast_syscall+0x1/0x26)
+[  378.778646] Exception stack(0xc1c79fa8 to 0xc1c79ff0)
+sync之后的
+[  383.364386] mmc_blk_data_prep comm kworker/u4:2: blksz 512, blocks 33, card max block 65535, rq_byts 16896
+[  383.374175] CPU: 0 PID: 51 Comm: kworker/u4:2 Tainted: P           O      5.10.106 git#26debb45
+[  383.382878] Hardware name: Generic DT based system
+[  383.387691] Workqueue: writeback wb_workfn (flush-179:0)
+[  383.393044] [<c02112cd>] (unwind_backtrace) from [<c020ee7f>] (show_stack+0xb/0xc)
+[  383.400634] [<c020ee7f>] (show_stack) from [<c0488abf>] (dump_stack+0x5f/0x74)
+[  383.407878] [<c0488abf>] (dump_stack) from [<c03cff05>] (sdhci_send_command+0x10d/0x150)
+[  383.415986] [<c03cff05>] (sdhci_send_command) from [<c03cff67>] (sdhci_send_command_retry+0x1f/0xa8)
+[  383.425134] [<c03cff67>] (sdhci_send_command_retry) from [<c03d00a1>] (sdhci_request+0xb1/0xc8)
+[  383.433849] [<c03d00a1>] (sdhci_request) from [<c03c0951>] (mmc_start_request+0x49/0x5c)
+[  383.441955] [<c03c0951>] (mmc_start_request) from [<c048b5e5>] (mmc_blk_mq_issue_rw_rq+0x55/0xa0)
+[  383.450847] [<c048b5e5>] (mmc_blk_mq_issue_rw_rq) from [<c03cc2e5>] (mmc_blk_mq_issue_rq+0x183/0x196)
+[  383.460083] [<c03cc2e5>] (mmc_blk_mq_issue_rq) from [<c03cc6e7>] (mmc_mq_queue_rq+0x105/0x156)
+[  383.468717] [<c03cc6e7>] (mmc_mq_queue_rq) from [<c03226fb>] (__blk_mq_try_issue_directly+0x87/0xd8)
+[  383.477866] [<c03226fb>] (__blk_mq_try_issue_directly) from [<c0323adb>] (blk_mq_request_issue_directly+0x2f/0x4a)
+[  383.488231] [<c0323adb>] (blk_mq_request_issue_directly) from [<c0323b21>] (blk_mq_try_issue_list_directly+0x2b/0x74)
+[  383.498857] [<c0323b21>] (blk_mq_try_issue_list_directly) from [<c032648b>] (blk_mq_sched_insert_requests+0x91/0xe6)
+[  383.509394] [<c032648b>] (blk_mq_sched_insert_requests) from [<c0323a61>] (blk_mq_flush_plug_list+0x61/0xac)
+[  383.519241] [<c0323a61>] (blk_mq_flush_plug_list) from [<c031d5ad>] (blk_finish_plug+0x19/0x2c)
+[  383.527955] [<c031d5ad>] (blk_finish_plug) from [<c02a8915>] (wb_writeback+0x85/0x120)
+[  383.535889] [<c02a8915>] (wb_writeback) from [<c02a8ab3>] (wb_do_writeback+0x8b/0xfa)
+[  383.543735] [<c02a8ab3>] (wb_do_writeback) from [<c02a8db3>] (wb_workfn+0x4f/0x108)
+[  383.551412] [<c02a8db3>] (wb_workfn) from [<c02256a3>] (process_one_work+0xc7/0x12c)
+[  383.559174] [<c02256a3>] (process_one_work) from [<c022596b>] (worker_thread+0xaf/0x148)
+[  383.567285] [<c022596b>] (worker_thread) from [<c02289a3>] (kthread+0x9b/0xa4)
+[  383.574525] [<c02289a3>] (kthread) from [<c02082d5>] (ret_from_fork+0x11/0x1c)
+*/
 int __block_write_begin_int(struct folio *folio, loff_t pos, unsigned len,
 		get_block_t *get_block, const struct iomap *iomap)
 {
-	size_t from = offset_in_folio(folio, pos);
-	size_t to = from + len;
-	struct inode *inode = folio->mapping->host;
+	/* 计算数据的写入位置：页面内的起始和结束偏移 */
+	size_t from = offset_in_folio(folio, pos);	// 在页面内的起始偏移
+	size_t to = from + len;				// 在页面内的结束偏移
+	struct inode *inode = folio->mapping->host;	// 获取页面对应的inode
 	size_t block_start, block_end;
 	sector_t block;
 	int err = 0;
 	size_t blocksize;
 	struct buffer_head *bh, *head, *wait[2], **wait_bh=wait;
 
-	BUG_ON(!folio_test_locked(folio));
-	BUG_ON(to > folio_size(folio));
-	BUG_ON(from > to);
+	/* 基本参数检查 */
+	BUG_ON(!folio_test_locked(folio));	// 确保页面已被锁定
+	BUG_ON(to > folio_size(folio));		// 检查结束偏移不超过页面大小
+	BUG_ON(from > to);			// 确保起始偏移小于结束偏移
 
+	/* 为页面创建缓冲区头链表 */
 	head = folio_create_buffers(folio, inode, 0);
-	blocksize = head->b_size;
-	block = div_u64(folio_pos(folio), blocksize);
+	blocksize = head->b_size;			// 获取文件系统块大小
+	block = div_u64(folio_pos(folio), blocksize);	// 计算起始块号
 
+	/* 个人调试信息：打印当前进程名和文件名 */
+	struct hlist_node *tmp_list = NULL;
+	struct dentry *s_dentry = NULL;
+	hlist_for_each(tmp_list, &(inode->i_dentry)) {
+		s_dentry = hlist_entry(tmp_list, struct dentry, d_u.d_alias);
+		if (!IS_ERR(s_dentry))
+			pr_err("comm %s, filename %s !!\n",  current->comm, s_dentry->d_iname);
+	}
+
+	/* 遍历页面中的所有缓冲区 */
 	for (bh = head, block_start = 0; bh != head || !block_start;
 	    block++, block_start=block_end, bh = bh->b_this_page) {
 		block_end = block_start + blocksize;
+
+		/* 如果当前缓冲区不在写入范围内 */
 		if (block_end <= from || block_start >= to) {
 			if (folio_test_uptodate(folio)) {
 				if (!buffer_uptodate(bh))
@@ -2113,25 +2186,35 @@ int __block_write_begin_int(struct folio *folio, loff_t pos, unsigned len,
 			}
 			continue;
 		}
+		/* 清除新缓冲区标志 */
 		if (buffer_new(bh))
 			clear_buffer_new(bh);
+		/* 处理未映射的缓冲区, 未映射可能是写到文件末尾，需要新增空间*/
 		if (!buffer_mapped(bh)) {
 			WARN_ON(bh->b_size != blocksize);
 			if (get_block)
+				/* 调用文件系统的get_block函数获取物理块映射 */
+				// block: 文件的逻辑块号，表示要写入文件的位置
+				// 将文件写入位置对应的磁盘物理块号保存到bh->b_blocknr
+				// 最后的create参数传入1，表示需要申请新的空间
+				// fat_get_block
 				err = get_block(inode, block, bh, 1);
 			else
+				/* 使用iomap进行块映射 */
 				err = iomap_to_bh(inode, block, bh, iomap);
 			if (err)
 				break;
 
+			/* 处理新分配的块 */
 			if (buffer_new(bh)) {
 				clean_bdev_bh_alias(bh);
 				if (folio_test_uptodate(folio)) {
 					clear_buffer_new(bh);
 					set_buffer_uptodate(bh);
-					mark_buffer_dirty(bh);
+					mark_buffer_dirty(bh);	// set dirty，后面等脏数据回写
 					continue;
 				}
+				/* 对于部分写入的新块，将未写入部分清零 */
 				if (block_end > to || block_start < from)
 					folio_zero_segments(folio,
 						to, block_end,
@@ -2139,26 +2222,40 @@ int __block_write_begin_int(struct folio *folio, loff_t pos, unsigned len,
 				continue;
 			}
 		}
+		/* 如果页面是最新的，标记缓冲区也为最新 */
 		if (folio_test_uptodate(folio)) {
 			if (!buffer_uptodate(bh))
 				set_buffer_uptodate(bh);
 			continue; 
 		}
+		/*
+		 * 关键部分：决定是否需要读取缓冲区
+		 * 在以下情况下需要读取：
+		 * 1. 缓冲区不是最新的 (!buffer_uptodate(bh))
+		 * 2. 不是延迟分配的缓冲区 (!buffer_delay(bh))
+		 * 3. 不是未写入的缓冲区 (!buffer_unwritten(bh))
+		 * 4. 写入范围与缓冲区有部分重叠 (block_start < from || block_end > to)，也即是没对齐/超过了块大小
+		 *
+		 * 这种情况通常发生在部分页面写入时，为了保持数据一致性，
+		 * 需要先读取现有数据，然后再进行部分更新
+		 */
 		if (!buffer_uptodate(bh) && !buffer_delay(bh) &&
 		    !buffer_unwritten(bh) &&
 		     (block_start < from || block_end > to)) {
-			bh_read_nowait(bh, 0);
-			*wait_bh++=bh;
+			bh_read_nowait(bh, 0);		// 发起同步读取请求
+			*wait_bh++=bh;			// 将需要等待的缓冲区加入等待队列
 		}
 	}
 	/*
 	 * If we issued read requests - let them complete.
 	 */
+	/* 等待所有读操作完成 */
 	while(wait_bh > wait) {
 		wait_on_buffer(*--wait_bh);
 		if (!buffer_uptodate(*wait_bh))
-			err = -EIO;
+			err = -EIO;	// 如果读取失败，设置IO错误
 	}
+	/* 如果发生错误，将新分配的缓冲区清零 */
 	if (unlikely(err))
 		folio_zero_new_buffers(folio, from, to);
 	return err;

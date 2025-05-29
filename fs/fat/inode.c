@@ -114,56 +114,121 @@ int fat_add_cluster(struct inode *inode)
 		fat_free_clusters(inode, cluster);
 	return err;
 }
-
+/*
+ksys_write
+  --> vfs_write
+    --> generic_file_write_iter
+      --> __generic_file_write_iter
+        --> generic_perform_write	// 以foilo大小为单位进行循环写（老版本内核是以page为单位）
+	  --> fat_write_begin
+	    --> block_write_begin
+	      --> __block_write_begin
+	        --> __block_write_begin_int
+		  --> fat_get_block
+		    --> __fat_get_block
+		      --> fat_add_cluster
+		        --> fat_chain_add
+*/
+/**
+ * @brief 内联函数，用于获取fat文件系统中指定块的物理地址。
+ *
+ * 此函数是fat_get_block的核心实现部分，负责更详细的块映射和分配逻辑。
+ * 它根据inode、逻辑块号以及是否需要创建新块来确定物理块地址。
+ * 如果请求的块已经存在，则直接返回其物理地址；
+ * 如果需要创建新块，则尝试分配新的簇并更新相关元数据。
+ *
+ * @param inode 指向表示文件或目录的inode结构的指针。
+ * @param iblock 逻辑块号，表示要获取的块在文件中的偏移量。
+ * @param max_blocks 指向一个unsigned long类型的指针，用于存储当前缓冲区可以容纳的最大块数。
+ * @param bh_result 指向buffer_head结构的指针，用于存储最终的结果。
+ * @param create 标志位，指示是否需要创建新块（1为需要创建，0为不需要）。
+ * @return 返回值为int类型。如果成功，则返回0；如果失败，则返回错误码。
+ */
 static inline int __fat_get_block(struct inode *inode, sector_t iblock,
 				  unsigned long *max_blocks,
 				  struct buffer_head *bh_result, int create)
 {
-	struct super_block *sb = inode->i_sb;
-	struct msdos_sb_info *sbi = MSDOS_SB(sb);
+	struct super_block *sb = inode->i_sb;		//获取超级块
+	struct msdos_sb_info *sbi = MSDOS_SB(sb);	//获取fat fs的超级块信息
 	unsigned long mapped_blocks;
 	sector_t phys, last_block;
 	int err, offset;
 
+	/* 映射文件逻辑扇区到磁盘的物理扇区，phys 保存物理块号，mapped_blocks 保存映射的块数 */
 	err = fat_bmap(inode, iblock, &phys, &mapped_blocks, create, false);
 	if (err)
 		return err;
-	if (phys) {
+	if (phys) { //如果物理块号是有效的，则保存到bh_result并直接返回
 		map_bh(bh_result, sb, phys);
 		*max_blocks = min(mapped_blocks, *max_blocks);
 		return 0;
 	}
+
+	/*
+	 * 重点！！！
+	 * 如果不是写到文件末尾，则不需要创建新的空间，这里直接返回
+	 * 如果写到文件末尾，并且还要继续写，需要创建新的空间，则往下走
+	 */
 	if (!create)
 		return 0;
 
+	/*
+	 * 如果需要创建新的空间，表示已经写到文件末尾了，对比一下文件大小是否一致
+	 * 这个检测是为了检查文件大小是否被破坏、磁盘是否有损坏
+	 * 出现下面报错的可能原因：
+	 *	1.文件系统元数据损坏；
+	 *	2.文件大小信息不一致；
+	 *	3.文件系统被意外中断导致文件大小信息未正确更新；
+	 */
 	if (iblock != MSDOS_I(inode)->mmu_private >> sb->s_blocksize_bits) {
 		fat_fs_error(sb, "corrupted file size (i_pos %lld, %lld)",
 			MSDOS_I(inode)->i_pos, MSDOS_I(inode)->mmu_private);
 		return -EIO;
 	}
 
+	/* 计算文件最后一个块的编号 */
 	last_block = inode->i_blocks >> (sb->s_blocksize_bits - 9);
+	/* 计算块在簇内的偏移 */
 	offset = (unsigned long)iblock & (sbi->sec_per_clus - 1);
 	/*
 	 * allocate a cluster according to the following.
 	 * 1) no more available blocks
 	 * 2) not part of fallocate region
 	 */
+	 /*
+	  * 申请新簇的条件:
+	  * 1.文件没有更多的可用块；
+	  * 2.请求的块不在预分配区域；
+	  */
 	if (!offset && !(iblock < last_block)) {
 		/* TODO: multiple cluster allocation would be desirable. */
+		/* 分配新的簇 */
 		err = fat_add_cluster(inode);
 		if (err)
 			return err;
 	}
+
+	/* 计算当前簇内可用的块数 */
 	/* available blocks on this cluster */
 	mapped_blocks = sbi->sec_per_clus - offset;
 
+	/* 更新最大块数 */
 	*max_blocks = min(mapped_blocks, *max_blocks);
+	/* 更新文件大小 */
 	MSDOS_I(inode)->mmu_private += *max_blocks << sb->s_blocksize_bits;
 
+	/* 再次调用fat_bmap，确保新分配的块有被正确映射 */
 	err = fat_bmap(inode, iblock, &phys, &mapped_blocks, create, false);
 	if (err)
 		return err;
+	/*
+	 * 前面通过fat_add_cluster()已经成功分配到新的簇了，而且fat_bmap()也调用成功
+	 * 但是phys仍为0，表示没有找到对应的物理块，可能的原因有以下：
+	 *	1.fat表损坏，新分配的簇在fat表中没有正确链接；
+	 *	2.簇分配失败，虽然fat_add_cluster返回成功，但实际没有分配簇；
+	 *	3.fat表与簇的随影关系不一致，fat表显示簇已分配，但实际物理块映射失败；
+	 *	4.文件系统元数据不一致，fat表、目录项和实际簇分配状态不一致；
+	 */
 	if (!phys) {
 		fat_fs_error(sb,
 			     "invalid FAT chain (i_pos %lld, last_block %llu)",
@@ -172,23 +237,51 @@ static inline int __fat_get_block(struct inode *inode, sector_t iblock,
 		return -EIO;
 	}
 
+	/* 确保这两者是一致的 */
 	BUG_ON(*max_blocks != mapped_blocks);
+	/* 设置缓存区的状态为new */
 	set_buffer_new(bh_result);
+	/* 将物理块号映射到bh_result */
 	map_bh(bh_result, sb, phys);
 
 	return 0;
 }
 
+/**
+ * @brief 获取FAT文件系统中指定块的物理地址。
+ *
+ * 此函数用于根据inode和逻辑块号，计算出该块在磁盘上的实际物理地址。
+ * 如果需要创建新块（create为真），则会尝试分配新的块。
+ *
+ * @param inode 指向表示文件或目录的inode结构的指针。
+ * @param iblock，普通文件的起始簇号肯定不为0, 逻辑块号，表示要获取的块在文件中的偏移量。
+ * @param bh_result 指向buffer_head结构的指针，用于存储结果块信息。
+ * @param create 标志位，指示是否允许创建新块（1表示允许，0表示不允许）。
+ * @return 返回值：
+ *         - 成功时返回0。
+ *         - 失败时返回负的错误码。
+ */
+/* iblock: 文件逻辑块号，，表示要写入文件的位置
+ * 在fat系统中，逻辑块号是指相对于文件的位置，而物理块号是指实际磁盘上的块号
+ * 逻辑簇号和物理簇号也是同个道理
+ */
+
 static int fat_get_block(struct inode *inode, sector_t iblock,
 			 struct buffer_head *bh_result, int create)
 {
-	struct super_block *sb = inode->i_sb;
-	unsigned long max_blocks = bh_result->b_size >> inode->i_blkbits;
+	struct super_block *sb = inode->i_sb; // 获取超级块结构体指针。
+	unsigned long max_blocks = bh_result->b_size >> inode->i_blkbits; // 计算最大块数
 	int err;
 
+        /*
+	 * 调用__fat_get_block函数，获取指定块的详细信息。
+         * 参数包括inode、逻辑块号、最大块数、结果缓冲区以及创建标志。
+	 * 将文件逻辑块对应的物理块号保存到bh_result->b_blocknr: map_bh()接口
+	 */
 	err = __fat_get_block(inode, iblock, &max_blocks, bh_result, create);
 	if (err)
 		return err;
+        /* 更新结果缓冲区的大小，确保其与实际块大小一致 */
 	bh_result->b_size = max_blocks << sb->s_blocksize_bits;
 	return 0;
 }
@@ -219,6 +312,10 @@ static void fat_write_failed(struct address_space *mapping, loff_t to)
 	}
 }
 
+/*
+		status = a_ops->write_begin(file, mapping, pos, bytes,
+						&folio, &fsdata);
+*/
 static int fat_write_begin(struct file *file, struct address_space *mapping,
 			loff_t pos, unsigned len,
 			struct folio **foliop, void **fsdata)
@@ -488,15 +585,31 @@ static int fat_calc_dir_size(struct inode *inode)
 	return 0;
 }
 
+/* fat_fill_inode -> fat_validate_dir */
 static int fat_validate_dir(struct inode *dir)
 {
 	struct super_block *sb = dir->i_sb;
 
+	/*
+	 * 每个目录至少有两个链接（nlink）: .和..
+	 * i_nlink表示当前node的链接数目，如果小于2，说明目录项不完整，连.和..都没有
+	 * 说明目录结构已经损坏了，可能的原因如下：
+	 *	1.文件系统元数据损坏，比如突然断电或者未正常卸载等；
+	 *	2.目录项被意外删除或者覆盖；
+	 *	3.文件系统有bug;
+	 */
 	if (dir->i_nlink < 2) {
 		/* Directory should have "."/".." entries at least. */
 		fat_fs_error(sb, "corrupted directory (invalid entries)");
 		return -EIO;
 	}
+	/*
+	 * i_start表示该目录的物理起始簇号，一般不为0，也不能等于根目录的物理起始簇号
+	 * 可能的原因：
+	 *	1.目录项被错误地初始化或写入；
+	 *	2.文件系统元数据被破坏，导致目录项的物理起始簇号丢失或者被覆盖；
+	 *	3.恶意破坏或者文件系统bug;
+	 */
 	if (MSDOS_I(dir)->i_start == 0 ||
 	    MSDOS_I(dir)->i_start == MSDOS_SB(sb)->root_cluster) {
 		/* Directory should point valid cluster. */
@@ -506,6 +619,21 @@ static int fat_validate_dir(struct inode *dir)
 	return 0;
 }
 
+/* stat系统调用获取文件大小流程
+stat
+  --> vfs_fstatat
+    --> vfat_statx
+      --> filename_lookup
+        --> path_lookupat
+          --> walk_component
+	    --> lookup_slow
+	      --> __lookup_slow
+	        --> vfat_lookup		// 从卡的目录项区域获取de
+	          --> fat_build_inode
+		    --> fat_fill_inode
+*/
+
+/* 用从卡根目录项获取到的de来更新文件系统的文件信息，包括文件大小等 */
 /* doesn't deal with root inode */
 int fat_fill_inode(struct inode *inode, struct msdos_dir_entry *de)
 {
@@ -545,7 +673,7 @@ int fat_fill_inode(struct inode *inode, struct msdos_dir_entry *de)
 		MSDOS_I(inode)->i_start = fat_get_start(sbi, de);
 
 		MSDOS_I(inode)->i_logstart = MSDOS_I(inode)->i_start;
-		inode->i_size = le32_to_cpu(de->size);
+		inode->i_size = le32_to_cpu(de->size);		// 文件大小
 		inode->i_op = &fat_file_inode_operations;
 		inode->i_fop = &fat_file_operations;
 		inode->i_mapping->a_ops = &fat_aops;
@@ -848,6 +976,22 @@ static int fat_statfs(struct dentry *dentry, struct kstatfs *buf)
 	return 0;
 }
 
+/*
+系统内存紧张时，触发IO脏数据回写，更新inode信息到磁盘，这时候就把文件size更新到sd卡的根目录项区域中。
+kthread
+  --> worker_thread
+    --> process_one_work
+      --> process_one_work
+        --> wb_workfn
+	  --> wb_do_writeback
+	    --> wb_writeback
+	      --> __writeback_inodes_wb
+	        --> writeback_sb_inodes
+		  --> __writeback_single_inode
+		    --> __fat_write_inode
+		      --> sync_dirty_buffer
+		        --> submit_bh(REQ_OP_WRITE, op_flags, bh);
+*/
 static int __fat_write_inode(struct inode *inode, int wait)
 {
 	struct super_block *sb = inode->i_sb;
@@ -885,9 +1029,9 @@ retry:
 	if (S_ISDIR(inode->i_mode))
 		raw_entry->size = 0;
 	else
-		raw_entry->size = cpu_to_le32(inode->i_size);
+		raw_entry->size = cpu_to_le32(inode->i_size);	// 文件大小
 	raw_entry->attr = fat_make_attrs(inode);
-	fat_set_start(raw_entry, MSDOS_I(inode)->i_logstart);
+	fat_set_start(raw_entry, MSDOS_I(inode)->i_logstart);	// 起始簇号
 	mtime = inode_get_mtime(inode);
 	fat_time_unix2fat(sbi, &mtime, &raw_entry->time,
 			  &raw_entry->date, NULL);
@@ -903,7 +1047,7 @@ retry:
 	mark_buffer_dirty(bh);
 	err = 0;
 	if (wait)
-		err = sync_dirty_buffer(bh);
+		err = sync_dirty_buffer(bh);	// 更新到卡的fat dir dentry
 	brelse(bh);
 	return err;
 }

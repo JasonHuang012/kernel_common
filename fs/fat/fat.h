@@ -70,7 +70,7 @@ struct msdos_sb_info {
 	unsigned char fats, fat_bits; /* number of FATs, FAT bits (12,16 or 32) */
 	unsigned short fat_start;
 	unsigned long fat_length;     /* FAT start & length (sec.) */
-	unsigned long dir_start;
+	unsigned long dir_start;	// 根目录项的起始地址（簇号）
 	unsigned short dir_entries;   /* root dir start & entries */
 	unsigned long data_start;     /* first data sector */
 	unsigned long max_cluster;    /* maximum cluster number */
@@ -122,10 +122,10 @@ struct msdos_inode_info {
 	/* NOTE: mmu_private is 64bits, so must hold ->i_mutex to access */
 	loff_t mmu_private;	/* physically allocated size */
 
-	int i_start;		/* first cluster or 0 */
-	int i_logstart;		/* logical first cluster */
+	int i_start;		/* first cluster or 0 */	// 文件物理起始簇号（物理磁盘中的位置，一般不为0）
+	int i_logstart;		/* logical first cluster */	// 文件逻辑起始簇号，通常和i_start相同，一些特例除外（文件截断后重新分配）
 	int i_attrs;		/* unused attribute bits */
-	loff_t i_pos;		/* on-disk position of directory entry or 0 */
+	loff_t i_pos;		/* on-disk position of directory entry or 0 */ // 文件目录项在磁盘上的位置偏移
 	struct hlist_node i_fat_hash;	/* hash by i_location */
 	struct hlist_node i_dir_hash;	/* hash by i_logstart */
 	struct rw_semaphore truncate_lock; /* protect bmap against truncate */
@@ -343,15 +343,15 @@ extern int fat_remove_entries(struct inode *dir, struct fat_slot_info *sinfo);
 
 /* fat/fatent.c */
 struct fat_entry {
-	int entry;
+	int entry;			// 当前fat条目值，也即是当前物理簇号
 	union {
 		u8 *ent12_p[2];
 		__le16 *ent16_p;
-		__le32 *ent32_p;
+		__le32 *ent32_p;	// 指向下一个物理簇
 	} u;
-	int nr_bhs;
-	struct buffer_head *bhs[2];
-	struct inode *fat_inode;
+	int nr_bhs;			// 当前使用的buffer_head数目
+	struct buffer_head *bhs[2];	// fat表缓存，用于缓存fat表数据，最多支持2个buffer_head
+	struct inode *fat_inode;	// 指向当前fat表的inode
 };
 
 static inline void fatent_init(struct fat_entry *fatent)

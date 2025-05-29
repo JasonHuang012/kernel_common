@@ -1729,6 +1729,7 @@ again:
 			dentry = ERR_PTR(error);
 		}
 	} else {
+		/* 例如vfat_lookup */
 		old = inode->i_op->lookup(inode, dentry, flags);
 		d_lookup_done(dentry);
 		if (unlikely(old)) {

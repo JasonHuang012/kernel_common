@@ -327,6 +327,13 @@ static int mmc_mrq_prep(struct mmc_host *host, struct mmc_request *mrq)
 			mrq->stop->error = 0;
 			mrq->stop->mrq = mrq;
 		}
+
+		/* 个人调试信息：sd卡读写操作 */
+		if (mrq->cmd->opcode == 24 || mrq->cmd->opcode == 25)
+			pr_info("sd write: comm %s blocks %d size %d\n", current->comm, sz / 512, sz);
+		else if (mrq->cmd->opcode == 17 || mrq->cmd->opcode == 18)
+			pr_info("sd read: comm %s blocks %d size %d\n", current->comm, sz / 512, sz);
+
 	}
 
 	return 0;

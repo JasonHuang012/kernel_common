@@ -104,6 +104,11 @@ int fat_clusters_flush(struct super_block *sb)
  * fat_chain_add() adds a new cluster to the chain of clusters represented
  * by inode.
  */
+ /*
+  * 将新的物理簇添加到文件对应的FAT簇链中
+  * new_dclus，表示前面已经申请到的物理簇号
+  * nr_cluster，表示新申请的簇的数目
+  */
 int fat_chain_add(struct inode *inode, int new_dclus, int nr_cluster)
 {
 	struct super_block *sb = inode->i_sb;
@@ -115,24 +120,35 @@ int fat_chain_add(struct inode *inode, int new_dclus, int nr_cluster)
 	 * one (new_dclus) to the end of the link list (the FAT).
 	 */
 	last = new_fclus = 0;
+	/*
+	 * 如果i_start为0，说明还没为文件分配磁盘空间
+	 * 如果i_start不为0，文件物理起始簇号不为0，说明前面已经为文件分配过磁盘空间了
+	 */
 	if (MSDOS_I(inode)->i_start) {
 		int fclus, dclus;
 
+		/*
+		 * 参数cluster传入FAT_ENT_EOF，表示要找文件的最后一个簇的信息，包括文件逻辑簇号和磁盘物理簇号
+		 * fclus: 文件逻辑簇号，表示文件大小（未分配新簇之前的大小）
+		 * dclus: 磁盘物理簇号，表示文件在磁盘的最后一个簇（在分配新簇之前）
+		 */
 		ret = fat_get_cluster(inode, FAT_ENT_EOF, &fclus, &dclus);
 		if (ret < 0)
 			return ret;
-		new_fclus = fclus + 1;
-		last = dclus;
+		new_fclus = fclus + 1;	// 文件逻辑簇号加1，表示新的文件大小
+		last = dclus;		// 记录文件末尾物理簇号
 	}
 
 	/* add new one to the last of the cluster chain */
-	if (last) {
+	if (last) {// 如果不是第一个cluster，也就是文件之前已经分配了簇空间，即将新簇添加到簇链末尾
 		struct fat_entry fatent;
 
 		fatent_init(&fatent);
+		/* 获取文件最后一个物理簇对应的FAT表项(FAT条目) */
 		ret = fat_ent_read(inode, &fatent, last);
 		if (ret >= 0) {
-			int wait = inode_needs_sync(inode);
+			int wait = inode_needs_sync(inode);	//检查是否需要同步
+			/* 更新FAT表项，将上一个簇指向新的簇 */
 			ret = fat_ent_write(inode, &fatent, new_dclus, wait);
 			fatent_brelse(&fatent);
 		}
@@ -143,27 +159,43 @@ int fat_chain_add(struct inode *inode, int new_dclus, int nr_cluster)
 		 * assuming to be called after linear search with fat_cache_id.
 		 */
 //		fat_cache_add(inode, new_fclus, new_dclus);
-	} else {
+	} else {// 第一次为文件分配磁盘空间，分配的第一个cluster(新文件)
 		MSDOS_I(inode)->i_start = new_dclus;
 		MSDOS_I(inode)->i_logstart = new_dclus;
 		/*
 		 * Since generic_write_sync() synchronizes regular files later,
 		 * we sync here only directories.
 		 */
-		if (S_ISDIR(inode->i_mode) && IS_DIRSYNC(inode)) {
+		/* 由于普通文件会在稍后同步，这里只同步目录 */
+		if (S_ISDIR(inode->i_mode) && IS_DIRSYNC(inode)) {	// 目录
 			ret = fat_sync_inode(inode);
 			if (ret)
 				return ret;
 		} else
-			mark_inode_dirty(inode);
+			mark_inode_dirty(inode);	// 设置inode为dirty
 	}
+	/* 检查文件大小信息是否匹配
+	 * new_fclus从卡目录项获取的文件大小信息，后者是从文件系统inode数据的大小
+	 * 如果两者不相等，可能的原因：
+	 *	1.卡目录项信息损坏；
+	 *	2.软件bug，更新到卡目录项信息是错误的，拿到大小信息不是真实文件大小信息；
+	 *	3.软件bug，或者系统内存不稳定，拿到的inode信息是错的。
+	 */
 	if (new_fclus != (inode->i_blocks >> (sbi->cluster_bits - 9))) {
-		fat_fs_error(sb, "clusters badly computed (%d != %llu)",
+		/* 个人调试信息：根据inode打印文件名字 */
+		struct hlist_node *tmp_list = NULL;
+		struct dentry *s_dentry = NULL;
+
+		hlist_for_each(tmp_list, &(inode->i_dentry)) {
+			s_dentry = hlist_entry(tmp_list, struct dentry, d_u.d_alias);
+		}
+		fat_fs_error(sb, "clusters badly computed (%d != %llu), file %s",
 			     new_fclus,
-			     (llu)(inode->i_blocks >> (sbi->cluster_bits - 9)));
+			     (llu)(inode->i_blocks >> (sbi->cluster_bits - 9)),
+			     !IS_ERR(s_dentry) ? s_dentry->d_iname: "unknown");
 		fat_cache_inval_inode(inode);
 	}
-	inode->i_blocks += nr_cluster << (sbi->cluster_bits - 9);
+	inode->i_blocks += nr_cluster << (sbi->cluster_bits - 9);	// 更新文件大小(块数)
 
 	return 0;
 }

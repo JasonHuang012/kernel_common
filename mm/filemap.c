@@ -4018,6 +4018,7 @@ ssize_t generic_perform_write(struct kiocb *iocb, struct iov_iter *i)
 	loff_t pos = iocb->ki_pos;
 	struct address_space *mapping = file->f_mapping;
 	const struct address_space_operations *a_ops = mapping->a_ops;
+	// 获取folio大小
 	size_t chunk = mapping_max_folio_size(mapping);
 	long status = 0;
 	ssize_t written = 0;
@@ -4029,9 +4030,11 @@ ssize_t generic_perform_write(struct kiocb *iocb, struct iov_iter *i)
 		size_t copied;		/* Bytes copied from user */
 		void *fsdata = NULL;
 
+		// 写数据的大小
 		bytes = iov_iter_count(i);
 retry:
 		offset = pos & (chunk - 1);
+		// 以folio大小为单位进行操作，直到小于folio大小时一次性操作
 		bytes = min(chunk - offset, bytes);
 		balance_dirty_pages_ratelimited(mapping);
 

@@ -709,6 +709,7 @@ static struct dentry *vfat_lookup(struct inode *dir, struct dentry *dentry,
 
 	mutex_lock(&MSDOS_SB(sb)->s_lock);
 
+	/* 获取sinfo.de */
 	err = vfat_find(dir, &dentry->d_name, &sinfo);
 	if (err) {
 		if (err == -ENOENT) {
