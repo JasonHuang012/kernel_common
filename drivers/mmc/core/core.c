@@ -47,6 +47,10 @@
 #include "sd_ops.h"
 #include "sdio_ops.h"
 
+#ifdef CONFIG_XXX
+#include "monitor.h"
+#endif
+
 /* The max erase timeout, used when host->max_busy_timeout isn't specified */
 #define MMC_ERASE_TIMEOUT_MS	(60 * 1000) /* 60 s */
 #define SD_DISCARD_TIMEOUT_MS	(250)
@@ -328,12 +332,17 @@ static int mmc_mrq_prep(struct mmc_host *host, struct mmc_request *mrq)
 			mrq->stop->mrq = mrq;
 		}
 
+#ifdef CONFIG_XXX
+		mmc_read_write_monitor(mrq->cmd->opcode);
+#endif
+
+# if 0
 		/* 个人调试信息：sd卡读写操作 */
 		if (mrq->cmd->opcode == 24 || mrq->cmd->opcode == 25)
 			pr_info("sd write: comm %s blocks %d size %d\n", current->comm, sz / 512, sz);
 		else if (mrq->cmd->opcode == 17 || mrq->cmd->opcode == 18)
 			pr_info("sd read: comm %s blocks %d size %d\n", current->comm, sz / 512, sz);
-
+#endif
 	}
 
 	return 0;
@@ -2350,6 +2359,9 @@ static int __init mmc_init(void)
 	if (ret)
 		goto unregister_host_class;
 
+#ifdef CONFIG_XXX
+	mmc_monitor_init();
+#endif
 	return 0;
 
 unregister_host_class:
