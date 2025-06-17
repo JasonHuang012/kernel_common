@@ -152,6 +152,65 @@ void __contpte_try_unfold(struct mm_struct *mm, unsigned long addr,
 }
 EXPORT_SYMBOL_GPL(__contpte_try_unfold);
 
+/*
+   // 获取合并后的页表项状态
+   pte_t result_pte = contpte_ptep_get(ptep, orig_pte);
+
+   // 判断整体状态
+   if (pte_dirty(result_pte)) {
+       // 需要同步到磁盘
+       sync_to_disk();
+   }
+
+   if (pte_young(result_pte)) {
+       // 需要更新访问统计
+       update_access_stats();
+   }
+
+   // 如果需要知道具体哪个页表项的状态
+   pte_t *current_ptep = contpte_align_down(ptep);
+   for (int i = 0; i < CONT_PTES; i++) {
+       pte_t current_pte = __ptep_get(current_ptep + i);
+       if (pte_dirty(current_pte)) {
+           // 处理具体的脏页表项
+           handle_dirty_pte(current_ptep + i);
+       }
+   }
+*/
+/*
+ * 获取连续页表项的访问和脏位信息
+ * ptep: 指向页表项的指针
+ * orig_pte: 原始的页表项
+ *
+ * 返回值：
+ *	返回的orig_pte是一个合并的结果，包括了连续页表项中所有的ditry和access的页表项信息(或的方式)
+ *	返回值是一个"或"操作的结果：
+ *		如果任何一个页表项是脏的，最终结果就是脏的
+ *		如果任何一个页表项被访问过，最终结果就是已访问的
+ *
+ * 可以用于快速判断这段连续页表项是否有dtiry或者access的页表项，用法:
+ *	pte_t result_pte = contpte_ptep_get(ptep, orig_pte);
+ *	if (pte_dirty(result_pte)) {
+ *		// 表示在连续页表项范围内至少有一个页表项是脏的
+ *	}
+ *	if (pte_young(result_pte)) {
+ *		// 表示在连续页表项范围内至少有一个页表项被访问过
+ *	}
+ *
+ * 但是如果要知道具体哪个页表项是dirty还是access，还是只能逐个遍历来判断，如上面的上面的例子。
+ *
+ * 这个函数用于处理ARM64架构中的连续页表项(contiguous page table entries)。
+ * 它会遍历连续的页表项范围，收集所有页表项中的访问(access)和脏(dirty)位信息，
+ * 并将这些信息合并到原始的页表项中。
+ *
+ * 使用场景：
+ *	1. 在内存管理系统中，当需要获取连续页表项的访问和脏位状态时
+ *	2. 在页面迁移、内存回收等操作中，需要了解页面的访问历史
+ *	3. 在内存管理单元(MMU)操作中，需要同步页表项的状态
+ *
+ * 有个关于这个接口的优化补丁, 只要检测到一个dirty和一个access就提前break出来:
+ * https://lkml.org/lkml/2025/5/9/915
+ */
 pte_t contpte_ptep_get(pte_t *ptep, pte_t orig_pte)
 {
 	/*
@@ -160,18 +219,27 @@ pte_t contpte_ptep_get(pte_t *ptep, pte_t orig_pte)
 	 * contiguous range cannot be unfolded or otherwise modified under our
 	 * feet.
 	 */
+	/*
+         * 收集访问/脏位信息，这些信息可能分布在连续范围内的任何页表项中。
+         * 由于我们持有页表锁(PTL)，所以可以保证连续范围不会被展开或修改。
+         */
 
 	pte_t pte;
 	int i;
 
+	/* 将页表项指针对齐到连续页表项的开始位置 */
 	ptep = contpte_align_down(ptep);
 
+	/* 遍历所有连续的页表项 */
 	for (i = 0; i < CONT_PTES; i++, ptep++) {
+		/* 获取当前页表项的值 */
 		pte = __ptep_get(ptep);
 
+		/* 如果当前页表项为ditry，则更新原始页表项 */
 		if (pte_dirty(pte))
 			orig_pte = pte_mkdirty(orig_pte);
 
+		/* 如果房钱页表项被标记为已访问，则更新原始页表项 */
 		if (pte_young(pte))
 			orig_pte = pte_mkyoung(orig_pte);
 	}
