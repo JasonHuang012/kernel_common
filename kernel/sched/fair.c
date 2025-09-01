@@ -1164,17 +1164,18 @@ static void update_tg_load_avg(struct cfs_rq *cfs_rq)
 }
 #endif /* CONFIG_SMP */
 
+/* 更新当前调度实体的运行时间 */
 static s64 update_curr_se(struct rq *rq, struct sched_entity *curr)
 {
 	u64 now = rq_clock_task(rq);
 	s64 delta_exec;
 
-	delta_exec = now - curr->exec_start;
+	delta_exec = now - curr->exec_start;	// 获取这次运行的时间
 	if (unlikely(delta_exec <= 0))
 		return delta_exec;
 
-	curr->exec_start = now;
-	curr->sum_exec_runtime += delta_exec;
+	curr->exec_start = now;			// 更新exex_start
+	curr->sum_exec_runtime += delta_exec;	// 更新总的运行时间
 
 	if (schedstat_enabled()) {
 		struct sched_statistics *stats;
@@ -1246,43 +1247,67 @@ s64 update_curr_common(struct rq *rq)
 /*
  * Update the current task's runtime statistics.
  */
+/*
+ * 更新rq当前任务的运行统计信息
+ *
+ * 作用：更新当前运行任务的虚拟运行时间和其它统计信息，这是CFS调度器
+ *	 实现公平性的核心机制，通过更新vruntime来跟踪每个任务的执行时间
+ *
+ * 使用场景：
+ *	- 在任务切换时嗲用
+ *	- 在定时器中断中定期调用
+ *	- 在pick_task_fair中被调用以更新当前任务状态
+ *	- 用于维护调度器的公平性
+ */
 static void update_curr(struct cfs_rq *cfs_rq)
 {
 	struct sched_entity *curr = cfs_rq->curr;
 	struct rq *rq = rq_of(cfs_rq);
-	s64 delta_exec;
+	s64 delta_exec;		// 执行时间增量
 	bool resched;
 
+	/* 如果没有当前任务，直接返回 */
 	if (unlikely(!curr))
 		return;
 
+	/* 更新当前调度实体的运行时间，返回值是本次实际的运行时间 */
 	delta_exec = update_curr_se(rq, curr);
 	if (unlikely(delta_exec <= 0))
 		return;
 
+	/* 更新虚拟运行时间(根据实际运行时间和权重计算得到)，保证CFS公平性 */
 	curr->vruntime += calc_delta_fair(delta_exec, curr);
-	resched = update_deadline(cfs_rq, curr);
-	update_min_vruntime(cfs_rq);
+	resched = update_deadline(cfs_rq, curr);	// 更新截止时间
+	update_min_vruntime(cfs_rq);			// 更新最小虚拟运行时间
 
+	/* 如果是任务实体（而非任务组） */
 	if (entity_is_task(curr)) {
 		struct task_struct *p = task_of(curr);
 
-		update_curr_task(p, delta_exec);
+		update_curr_task(p, delta_exec);	// 更新任务的统计信息
 
 		/*
 		 * Any fair task that runs outside of fair_server should
 		 * account against fair_server such that it can account for
 		 * this time and possibly avoid running this period.
 		 */
+		/*
+                 * 任何在fair_server之外运行的公平任务都应该
+                 * 计入fair_server，这样它可以计算这段时间并
+                 * 可能避免在这个周期内运行
+		 */
 		if (p->dl_server != &rq->fair_server)
 			dl_server_update(&rq->fair_server, delta_exec);
 	}
 
+	/* 更新运行队列的剩余运行时间 */
 	account_cfs_rq_runtime(cfs_rq, delta_exec);
 
+	/* 如果只有一个任务，则不需要重新调度，直接返回 */
 	if (cfs_rq->nr_running == 1)
 		return;
 
+	/* 如果需要重新调度或发生了短期抢占，则重新调度 */
 	if (resched || did_preempt_short(cfs_rq, curr)) {
 		resched_curr(rq);
 		clear_buddies(cfs_rq, curr);
@@ -5854,16 +5879,23 @@ static int assign_cfs_rq_runtime(struct cfs_rq *cfs_rq)
 static void __account_cfs_rq_runtime(struct cfs_rq *cfs_rq, u64 delta_exec)
 {
 	/* dock delta_exec before expiring quota (as it could span periods) */
+	/* 扣减cfs rq的剩余运行时间 */
 	cfs_rq->runtime_remaining -= delta_exec;
 
+	/* 如果剩余运行时间大于0，则直接返回 */
 	if (likely(cfs_rq->runtime_remaining > 0))
 		return;
 
+	/* 如果剩余运行时间耗尽，且已经触发过限流，也直接返回 */
 	if (cfs_rq->throttled)
 		return;
 	/*
 	 * if we're unable to extend our runtime we resched so that the active
 	 * hierarchy can be throttled
+	 */
+	/*
+	 * 如果剩余运行时间不足，则调用assign_cfs_rq_runtime申请分配运行时间
+	 * 如果分配不到，则设置resched，表示需要重新调度
 	 */
 	if (!assign_cfs_rq_runtime(cfs_rq) && likely(cfs_rq->curr))
 		resched_curr(rq_of(cfs_rq));
@@ -5872,6 +5904,7 @@ static void __account_cfs_rq_runtime(struct cfs_rq *cfs_rq, u64 delta_exec)
 static __always_inline
 void account_cfs_rq_runtime(struct cfs_rq *cfs_rq, u64 delta_exec)
 {
+	/* 只用在开启带宽限制和运行限制时才往下走 */
 	if (!cfs_bandwidth_used() || !cfs_rq->runtime_enabled)
 		return;
 
@@ -8947,12 +8980,14 @@ again:
 
 	do {
 		/* Might not have done put_prev_entity() */
+		/* 可能没有执行put_prev_entity()，需要更新当前任务的统计信息 */
 		if (cfs_rq->curr && cfs_rq->curr->on_rq)
 			update_curr(cfs_rq);
 
 		if (unlikely(check_cfs_rq_runtime(cfs_rq)))
 			goto again;
 
+		/* 选择下一个调度实体 */
 		se = pick_next_entity(rq, cfs_rq);
 		if (!se)
 			goto again;
@@ -8965,6 +9000,13 @@ again:
 static void __set_next_task_fair(struct rq *rq, struct task_struct *p, bool first);
 static void set_next_task_fair(struct rq *rq, struct task_struct *p, bool first);
 
+/*
+ * 1.任务选择: 通过调用 pick_task_fair() 从CFS运行队列中选择虚拟运行时间最小的任务
+ * 2.调度实体管理: 处理调度实体的切换，包括前一个任务的退出和下一个任务的设置
+ * 3.组调度优化: 当启用公平组调度时，优化cgroup层次结构的操作
+ * 4.负载均衡: 当CPU空闲时，尝试从其他CPU迁移任务过来
+ * 5.空闲处理: 当没有可运行任务时，更新空闲时间统计
+ */
 struct task_struct *
 pick_next_task_fair(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 {
@@ -8973,13 +9015,16 @@ pick_next_task_fair(struct rq *rq, struct task_struct *prev, struct rq_flags *rf
 	int new_tasks;
 
 again:
+	/* 从cfs运行队列中挑选虚拟运行时间最小的任务 */
 	p = pick_task_fair(rq);
 	if (!p)
 		/* 如果找不到可运行的任务，则尝试newidle balance*/
 		goto idle;
+	/* 获取选中选中任务的调度实体se */
 	se = &p->se;
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
+	/* 如果前一个task不是公平调度类，这使用简单路径: 直接设置前一个任务和下一个任务 */
 	if (prev->sched_class != &fair_sched_class)
 		goto simple;
 
@@ -8996,6 +9041,16 @@ again:
 	 * is a different task than we started out with, try and touch the
 	 * least amount of cfs_rqs.
 	 */
+	/*
+         * 由于在dequeue_task_fair()中的set_next_buddy()操作，
+         * 下一个任务很可能与当前任务来自同一个cgroup。
+         *
+         * 因此尝试避免对整个cgroup层次结构进行put和set操作，
+         * 只改变实际发生变化的部分。
+         *
+         * 由于我们还没有执行put_prev_entity，如果选中的任务
+         * 与我们开始时不同，尝试接触最少的cfs_rqs。
+         */
 	if (prev != p) {
 		struct sched_entity *pse = &prev->se;
 		struct cfs_rq *cfs_rq;
@@ -9024,6 +9079,7 @@ again:
 
 simple:
 #endif
+        /* 简单路径：直接设置前一个任务和下一个任务 */
 	put_prev_set_next_task(rq, prev, p);
 	return p;
 
@@ -9031,7 +9087,7 @@ idle:
 	if (!rf)
 		return NULL;
 
-	/* 尝试newidle balance */
+	/* 尝试newidle balance, 从其它cpu迁移任务到当前cpu */
 	new_tasks = sched_balance_newidle(rq, rf);
 
 	/*
@@ -9039,6 +9095,11 @@ idle:
 	 * possible for any higher priority task to appear. In that case we
 	 * must re-start the pick_next_entity() loop.
 	 */
+        /*
+         * 由于sched_balance_newidle()会释放（并重新获取）rq->lock，
+         * 任何更高优先级的任务都可能出现。在这种情况下，
+         * 我们必须重新启动pick_next_entity()循环。
+         */
 	if (new_tasks < 0)
 		return RETRY_TASK;
 
@@ -9050,6 +9111,10 @@ idle:
 	 * rq is about to be idle, check if we need to update the
 	 * lost_idle_time of clock_pelt
 	 */
+        /*
+         * rq即将变为空闲状态，检查是否需要更新
+         * clock_pelt的lost_idle_time
+         */
 	update_idle_rq_clock_pelt(rq);
 
 	return NULL;
