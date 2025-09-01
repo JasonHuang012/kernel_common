@@ -1385,6 +1385,50 @@ out:
 }
 
 /*
+suspend时写卡，会select card
+[  478.869739] mmc_select_card
+[  478.872591] mmc cmd: 7
+[  478.875020] CPU: 0 PID: 257 Comm: workthread Tainted: P           O      5.10.106 git#5ba3644f
+[  478.883640] Hardware name: Generic DT based system
+[  478.888477] [<c02112cd>] (unwind_backtrace) from [<c020ee7f>] (show_stack+0xb/0xc)
+[  478.896070] [<c020ee7f>] (show_stack) from [<c0484b4b>] (dump_stack+0x6b/0x8c)
+[  478.903318] [<c0484b4b>] (dump_stack) from [<c03c0693>] (mmc_mrq_prep+0x97/0xac)
+[  478.910735] [<c03c0693>] (mmc_mrq_prep) from [<c03c0c6d>] (mmc_start_request+0x3d/0x5c)
+[  478.918753] [<c03c0c6d>] (mmc_start_request) from [<c03c0d91>] (mmc_wait_for_req+0x3d/0x70)
+[  478.927117] [<c03c0d91>] (mmc_wait_for_req) from [<c03c0e03>] (mmc_wait_for_cmd+0x3f/0x50)
+[  478.935398] [<c03c0e03>] (mmc_wait_for_cmd) from [<c0487265>] (_mmc_select_card+0x3d/0x4c)
+[  478.943684] [<c0487265>] (_mmc_select_card) from [<c03c672d>] (mmc_sd_init_card+0x12f/0x28a)
+[  478.952142] [<c03c672d>] (mmc_sd_init_card) from [<c03c68d7>] (mmc_sd_runtime_resume+0x2f/0x64)
+[  478.960861] [<c03c68d7>] (mmc_sd_runtime_resume) from [<c038f127>] (__rpm_callback+0x23/0x9e)
+[  478.969402] [<c038f127>] (__rpm_callback) from [<c038f1c9>] (rpm_callback+0x27/0x52)
+[  478.977159] [<c038f1c9>] (rpm_callback) from [<c038f54f>] (rpm_resume+0x24f/0x2b4)
+[  478.984745] [<c038f54f>] (rpm_resume) from [<c038f5db>] (__pm_runtime_resume+0x27/0x34)
+[  478.992761] [<c038f5db>] (__pm_runtime_resume) from [<c03c0d27>] (mmc_get_card+0xf/0x1c)
+[  479.000867] [<c03c0d27>] (mmc_get_card) from [<c03ccfdd>] (mmc_mq_queue_rq+0xcb/0x156)
+[  479.008809] [<c03ccfdd>] (mmc_mq_queue_rq) from [<c032290b>] (__blk_mq_try_issue_directly+0x87/0xd8)
+[  479.017964] [<c032290b>] (__blk_mq_try_issue_directly) from [<c0323ad7>] (blk_mq_try_issue_directly+0x33/0x6c)
+[  479.027984] [<c0323ad7>] (blk_mq_try_issue_directly) from [<c0323f6d>] (blk_mq_submit_bio+0x1f3/0x21a)
+[  479.037311] [<c0323f6d>] (blk_mq_submit_bio) from [<c031d45b>] (submit_bio_noacct+0x5b/0x9c)
+[  479.045774] [<c031d45b>] (submit_bio_noacct) from [<c02af517>] (submit_bh_wbc.constprop.0+0xcb/0xd8)
+[  479.054928] [<c02af517>] (submit_bh_wbc.constprop.0) from [<c02afc21>] (ll_rw_block+0x4d/0x6c)
+[  479.063560] [<c02afc21>] (ll_rw_block) from [<c02b1351>] (__block_write_begin_int+0x1bd/0x1ec)
+[  479.072191] [<c02b1351>] (__block_write_begin_int) from [<c02b1393>] (__block_write_begin+0x13/0x18)
+[  479.081340] [<c02b1393>] (__block_write_begin) from [<c02b13bf>] (block_write_begin+0x27/0x48)
+[  479.089972] [<c02b13bf>] (block_write_begin) from [<c02dc519>] (fat_write_begin+0x33/0x52)
+[  479.098259] [<c02dc519>] (fat_write_begin) from [<c026772f>] (generic_perform_write+0x7f/0x122)
+[  479.106981] [<c026772f>] (generic_perform_write) from [<c0268a93>] (__generic_file_write_iter+0x51/0x122)
+[  479.116567] [<c0268a93>] (__generic_file_write_iter) from [<c0268b91>] (generic_file_write_iter+0x2d/0x70)
+[  479.126240] [<c0268b91>] (generic_file_write_iter) from [<c028f11f>] (do_iter_readv_writev+0x7f/0xa2)
+[  479.135476] [<c028f11f>] (do_iter_readv_writev) from [<c028f6c7>] (do_iter_write+0x37/0x66)
+[  479.143844] [<c028f6c7>] (do_iter_write) from [<c028f751>] (vfs_writev+0x47/0x68)
+[  479.151342] [<c028f751>] (vfs_writev) from [<c028f7c1>] (do_writev+0x4f/0xb4)
+[  479.158495] [<c028f7c1>] (do_writev) from [<c0208221>] (ret_fast_syscall+0x1/0x26)
+[  479.166074] Exception stack(0xc14edfa8 to 0xc14edff0)
+[  479.171141] dfa0:                   00000002 00000000 0000001a b1ca3b40 00000002 00000000
+[  479.179335] dfc0: 00000002 00000000 b1ca3b40 00000092 aff24008 0007ff0c 0007ff0c b1ca3b40
+[  479.187522] dfe0: b6804c7c b1ca3b1c b679e178 b679e0d0
+*/
+/*
  * Handle the detection and initialisation of a card.
  *
  * In the case of a resume, "oldcard" will contain the card
@@ -1689,6 +1733,39 @@ out:
 	return err;
 }
 
+/*
+
+CMD7 - SELECT/DESELECT_CARD：用于选择或取消选择特定相对地址（RCA）的卡。选择卡后，后续的命令将只对该卡有效；取消选择则使卡进入待机状态。
+select      -->transfer，工作状态
+deselect  -->standby，低功耗状态
+
+suspend默认会deselect card，使得卡进入standby，但是中间我们有写卡操作，又select了card，退出standby，写完卡之后又在下一个suspend再进入standby，之后会在这两个状态不断切换
+suspend  card进入standby是Linux默认流程，与soc驱动无关；
+
+[   15.919788] mmc_deselect_cards
+[   15.922855] mmc cmd: 7
+[   15.925232] CPU: 0 PID: 559 Comm: kworker/u4:3 Tainted: P           O      5.10.106 git#5ba3644f
+[   15.934023] Hardware name: Generic DT based system
+[   15.938843] Workqueue: events_unbound async_run_entry_fn
+[   15.944191] [<c02112cd>] (unwind_backtrace) from [<c020ee7f>] (show_stack+0xb/0xc)
+[   15.951781] [<c020ee7f>] (show_stack) from [<c0484b4b>] (dump_stack+0x6b/0x8c)
+[   15.959028] [<c0484b4b>] (dump_stack) from [<c03c0693>] (mmc_mrq_prep+0x97/0xac)
+[   15.966443] [<c03c0693>] (mmc_mrq_prep) from [<c03c0c6d>] (mmc_start_request+0x3d/0x5c)
+[   15.974461] [<c03c0c6d>] (mmc_start_request) from [<c03c0d91>] (mmc_wait_for_req+0x3d/0x70)
+[   15.982825] [<c03c0d91>] (mmc_wait_for_req) from [<c03c0e03>] (mmc_wait_for_cmd+0x3f/0x50)
+[   15.991105] [<c03c0e03>] (mmc_wait_for_cmd) from [<c0487265>] (_mmc_select_card+0x3d/0x4c)
+[   15.999389] [<c0487265>] (_mmc_select_card) from [<c03c5fa1>] (_mmc_sd_suspend+0x3d/0x4c)
+[   16.007585] [<c03c5fa1>] (_mmc_sd_suspend) from [<c03c62c7>] (mmc_sd_suspend+0xf/0x34)
+[   16.015520] [<c03c62c7>] (mmc_sd_suspend) from [<c03c1cdb>] (mmc_bus_suspend+0x1b/0x28)
+[   16.023547] [<c03c1cdb>] (mmc_bus_suspend) from [<c03905df>] (dpm_run_callback+0x17/0x30)
+[   16.031745] [<c03905df>] (dpm_run_callback) from [<c039093d>] (__device_suspend+0x109/0x230)
+[   16.040198] [<c039093d>] (__device_suspend) from [<c0390a75>] (async_suspend+0x11/0x40)
+[   16.048217] [<c0390a75>] (async_suspend) from [<c022a54f>] (async_run_entry_fn+0x57/0x11c)
+[   16.056504] [<c022a54f>] (async_run_entry_fn) from [<c02256bb>] (process_one_work+0xc7/0x12c)
+[   16.065050] [<c02256bb>] (process_one_work) from [<c0225983>] (worker_thread+0xaf/0x148)
+[   16.073162] [<c0225983>] (worker_thread) from [<c02289bb>] (kthread+0x9b/0xa4)
+[   16.080404] [<c02289bb>] (kthread) from [<c02082d5>] (ret_from_fork+0x11/0x1c)
+*/
 static int _mmc_sd_suspend(struct mmc_host *host)
 {
 	struct mmc_card *card = host->card;
