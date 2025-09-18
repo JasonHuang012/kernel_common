@@ -164,6 +164,10 @@ static inline void __list_add(struct list_head *new,
  * Insert a new entry after the specified head.
  * This is good for implementing stacks.
  */
+/*
+ * 将new插入到链表头部，也就是head后面，head->next
+ * 注意: head只是一个list_head结构体，不是链表的第一个有效数据
+ */
 static inline void list_add(struct list_head *new, struct list_head *head)
 {
 	__list_add(new, head, head->next);
@@ -178,10 +182,29 @@ static inline void list_add(struct list_head *new, struct list_head *head)
  * Insert a new entry before the specified head.
  * This is useful for implementing queues.
  */
+/* 将new插入到链表尾部，也就是head前面，head->prev */
 static inline void list_add_tail(struct list_head *new, struct list_head *head)
 {
 	__list_add(new, head->prev, head);
 }
+
+/*
+ * list_add 和 list_add_tail的区别是：
+ * list_add 始终是在链表头后的的第一个位置进行插入
+ * 例如链表：    head --> 数据1 --> 数据2 --> 数据3，
+ * 插入新元素后：head --> new --> 数据1 --> 数据2 --> 数据3
+ *
+ * list_add_tail 始终实在链表末尾插入新元素
+ * 例如链表：    head --> 数据1 --> 数据2 --> 数据3，
+ * 插入新元素后：head --> 数据1 --> 数据2 --> 数据3 --> new
+ *
+ * 仔细分析上述函数，可以发现其函数抽象的巧妙。
+ * __list_add 接收三个参数：分别是new, prev, next。
+ * 任何位置的双链表插入操作，只需这3个参数。那么new元素一定是在prev和next之间进行插入。
+ * 所以很明显：
+ *	list_add是在head和head->next之间插入，那就是插入作为链表的第一个元素。
+ *      list_add_tail实在head->prev和head之间插入，那就是插入作为链表的最后一个元素。
+ */
 
 /*
  * Delete a list entry by making the prev/next entries
@@ -210,6 +233,9 @@ static inline void __list_del_clearprev(struct list_head *entry)
 	entry->prev = NULL;
 }
 
+/*
+ * 将节点(list)从其所在的链表删除
+ */
 static inline void __list_del_entry(struct list_head *entry)
 {
 	if (!__list_del_entry_valid(entry))
@@ -223,6 +249,9 @@ static inline void __list_del_entry(struct list_head *entry)
  * @entry: the element to delete from the list.
  * Note: list_empty() on entry does not return true after this, the entry is
  * in an undefined state.
+ */
+/*
+ * 将节点(list)从其所在的链表删除
  */
 static inline void list_del(struct list_head *entry)
 {
@@ -293,6 +322,9 @@ static inline void list_del_init(struct list_head *entry)
  * @list: the entry to move
  * @head: the head that will precede our entry
  */
+/*
+ * 将节点(list)从其原来的链表删除，并添加到另一个链表(head)的头部
+ */
 static inline void list_move(struct list_head *list, struct list_head *head)
 {
 	__list_del_entry(list);
@@ -303,6 +335,9 @@ static inline void list_move(struct list_head *list, struct list_head *head)
  * list_move_tail - delete from one list and add as another's tail
  * @list: the entry to move
  * @head: the head that will follow our entry
+ */
+/*
+ * 将节点(list)从其原来的链表删除，并添加到另一个链表(head)的尾部
  */
 static inline void list_move_tail(struct list_head *list,
 				  struct list_head *head)
@@ -539,6 +574,14 @@ static inline void __list_splice(const struct list_head *list,
  * @list: the new list to add.
  * @head: the place to add it in the first list.
  */
+/*
+ * 将链表（list）插入到另一个链表（head）的头部
+ *
+ * 如果list链表为空，则不做处理
+ * 链表list: (list 2 3)
+ * 链表head: (head 5 6)
+ * 拼接后变为: (head 2 3 5 6)    抛弃list链表的链表头
+ */
 static inline void list_splice(const struct list_head *list,
 				struct list_head *head)
 {
@@ -550,6 +593,14 @@ static inline void list_splice(const struct list_head *list,
  * list_splice_tail - join two lists, each list being a queue
  * @list: the new list to add.
  * @head: the place to add it in the first list.
+ */
+/*
+ * 将链表（list）插入到另一个链表（head）的尾部
+ *
+ * 如果list链表为空，则不做处理
+ * 链表list: (list 2 3)
+ * 链表head: (head 5 6)
+ * 拼接后变为: (head 5 6 2 3)    抛弃list链表的链表头
  */
 static inline void list_splice_tail(struct list_head *list,
 				struct list_head *head)

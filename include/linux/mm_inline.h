@@ -315,9 +315,13 @@ static inline bool lru_gen_del_folio(struct lruvec *lruvec, struct folio *folio,
 
 #endif /* CONFIG_LRU_GEN */
 
+/*
+ * 将folio直接接到对应的LRU链表中(而不是先加到cpu缓存)
+ */
 static __always_inline
 void lruvec_add_folio(struct lruvec *lruvec, struct folio *folio)
 {
+	/* 获取folio对应的LRU链表, 比如LRU file active list */
 	enum lru_list lru = folio_lru_list(folio);
 
 	if (lru_gen_add_folio(lruvec, folio, false))

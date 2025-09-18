@@ -1723,6 +1723,14 @@ extern struct pid *cad_pid;
 #define PF_DUMPCORE		0x00000200	/* Dumped core */
 #define PF_SIGNALED		0x00000400	/* Killed by a signal */
 #define PF_MEMALLOC		0x00000800	/* Allocating memory to free memory. See memalloc_noreclaim_save() */
+						/*
+						 * 允许当前线程在系统内存几度紧张的情况下仍能分配到内存，一般用于内存回收释放路径，
+						 * kswap或者direct reclaim
+						 * 避免内存回收流程因为分配不到内存而进入死锁或无线重试的场地
+						 *
+						 * 当一个线程设置了 PF_MEMALLOC 后，它在进行内存分配时，
+						 * 分配器会绕过所有水位线检查 (__GFP_MEMALLOC 标志会在内部被使用)
+						 */
 #define PF_NPROC_EXCEEDED	0x00001000	/* set_user() noticed that RLIMIT_NPROC was exceeded */
 #define PF_USED_MATH		0x00002000	/* If unset the fpu must be initialized before use */
 #define PF_USER_WORKER		0x00004000	/* Kernel thread cloned from userspace thread */

@@ -650,34 +650,55 @@ static pageout_t pageout(struct folio *folio, struct address_space *mapping,
 	 * swap_backing_dev_info is bust: it doesn't reflect the
 	 * congestion state of the swapdevs.  Easy to fix, if needed.
 	 */
+	/*
+	 * 检查folio是否可释放：主要检查是否有进程正在回写该页
+	 * 这是为了防止回收过程被页面缓存活动阻塞。
+	 *
+	 * 不可释放，则保留页面，后续还是放回LRU inactive链表
+	 */
 	if (!is_page_cache_freeable(folio))
 		return PAGE_KEEP;
+
+	/*
+	 * 处理没有地址空间映射的folio（罕见情况）。
+	 * 一些数据日志系统（如journaling）可能产生这种orphaned folio：
+	 * 它们没有mapping但却是脏的，同时拥有干净的缓冲区。
+	 */
 	if (!mapping) {
 		/*
 		 * Some data journaling orphaned folios can have
 		 * folio->mapping == NULL while being dirty with clean buffers.
 		 */
+		/* 页面有对应的缓存(buffer) */
 		if (folio_test_private(folio)) {
+			/*
+			 * 尝试释放folio对应的缓存
+			 * 如果成功则清除dirty标志表示，返回PAGE_CLEAN, 后续继续回收
+			 */
 			if (try_to_free_buffers(folio)) {
 				folio_clear_dirty(folio);
 				pr_info("%s: orphaned folio\n", __func__);
 				return PAGE_CLEAN;
 			}
 		}
+		/* 无法处理，保留页面 */
 		return PAGE_KEEP;
 	}
+
+	/* 没有对应的writeback接口，无法回写，只能激活 */
 	if (mapping->a_ops->writepage == NULL)
 		return PAGE_ACTIVATE;
 
+	/* 清除folio dirty标志（需要同步） */
 	if (folio_clear_dirty_for_io(folio)) {
 		int res;
 		struct writeback_control wbc = {
-			.sync_mode = WB_SYNC_NONE,
+			.sync_mode = WB_SYNC_NONE,		// 异步writeback，不需等待
 			.nr_to_write = SWAP_CLUSTER_MAX,
-			.range_start = 0,
+			.range_start = 0,			// 整个文件范围
 			.range_end = LLONG_MAX,
-			.for_reclaim = 1,
-			.swap_plug = plug,
+			.for_reclaim = 1,			// 表明是回收上下文
+			.swap_plug = plug,			// I/O插销，用于优化？
 		};
 
 		/*
@@ -685,24 +706,37 @@ static pageout_t pageout(struct folio *folio, struct address_space *mapping,
 		 * not enabled or contiguous swap entries are failed to
 		 * allocate.
 		 */
+		/*
+		 * 特殊处理：如果是shmem大folio且不支持THP_SWAP，或者分配连续交换项失败，
+		 * 可能需要分割folio。将folio_list传递给writepage，以便在需要时进行分割。
+		 */
 		if (shmem_mapping(mapping) && folio_test_large(folio))
 			wbc.list = folio_list;
 
+		/* 设置PG_reclaim回收标志 */
 		folio_set_reclaim(folio);
+		/* 调用具体的writeback接口, 待办：zram的writeback流程及接口 */
 		res = mapping->a_ops->writepage(&folio->page, &wbc);
 		if (res < 0)
 			handle_write_error(mapping, folio, res);
+		/* 写回过程中决定激活页面（如需要先锁定等）*/
 		if (res == AOP_WRITEPAGE_ACTIVATE) {
 			folio_clear_reclaim(folio);
 			return PAGE_ACTIVATE;
 		}
 
+		/*
+		 * 检查页面是否真的进入了写回状态。
+		 * 如果没有，可能是同步写回（已完成）或者a_ops实现有问题。
+		 */
 		if (!folio_test_writeback(folio)) {
 			/* synchronous write or broken a_ops? */
 			folio_clear_reclaim(folio);
 		}
+		/* 记录追踪事件和统计信息 */
 		trace_mm_vmscan_write_folio(folio);
 		node_stat_add_folio(folio, NR_VMSCAN_WRITE);
+		/* writeback成功 */
 		return PAGE_SUCCESS;
 	}
 
@@ -858,19 +892,113 @@ enum folio_references {
 	FOLIOREF_ACTIVATE,
 };
 
+
+
+/*
+do_try_to_free_pages
+  --> shrink_zones [__node_reclaim] [kswapd_shrink_node]
+    --> shrink_node
+
+mem_cgroup_shrink_node
+  --> shrink_lruvec
+    --> lru_gen_shrink_lruvec
+    --> get_scan_count [only called by shrink_list()]
+    --> shrink_list
+
+
+
+shrink_inactive_list
+	shrink_folio_list
+
+reclaim_clean_pages_from_list
+	shrink_folio_list
+
+reclaim_pages
+	--> reclaim_folio_list
+		--> shrink_folio_list
+
+evict_folios
+	--> shrink_folio_list
+
+kswapd
+	--> balance_pgdat
+		--> kswapd_age_node
+		--> memcg1_soft_limit_reclaim
+		--> kswapd_shrink_node
+			--> shrink_node
+				--> prepare_scan_control
+				--> shrink_node_memcgs
+					--> shrink_lruvec
+						--> lru_gen_shrink_lruvec
+						--> get_scan_count [only called by shrink_list()]
+						--> shrink_list
+							--> shrink_inactive_list
+								--> isolate_lru_folios
+								--> shrink_folio_list
+									--> folio_check_references
+									--> try_to_unmap
+									--> pageout
+									--> filemap_release_folio
+									--> __remove_mapping
+									--> free_unref_folios
+								--> move_folios_to_lru
+							--> shrink_active_list
+						--> shrink_inactive_list
+					--> shrink_slab
+
+
+*/
+
+/*
+分为两种情况：
+
+(A).referenced_ptes等于0（说明近期该页面没有被访问过）
+	1.匿名页，直接回收；
+	2.文件页：
+	  1.2.如果设置PG_referenced（说明该页面之前有被访问过），需要是clean状态(非脏页)，也就是如果是dirty，需要writeback之后才能回收；
+	  1.1.如果没有设置PG_referenced，直接回收；
+
+(B).referenced_ptes大于0（说明近期该页面有被访问过）
+	1.匿名页，加入active list；
+	2.文件页：
+	  2.1.如果referenced_ptes >= 2（近期被多个进程访问过），加入active list;
+	  2.2.如果referenced_ptes = 1，并且设置了PG_referenced，说明之前被访问过，最近又被访问过，加入active list;(体现第二次机会法)
+	  2.3.如果referenced_ptes = 1，并且是可执行的页面(比如动态库)，加入active list;
+	  2.4.如果只有referenced_ptes = 1，将其从inactive的链表尾部移动到链表头部，并设置PG_referenced；
+
+总之，只回收引用计数为0的页面
+*/
 static enum folio_references folio_check_references(struct folio *folio,
 						  struct scan_control *sc)
 {
 	int referenced_ptes, referenced_folio;
 	unsigned long vm_flags;
 
+	/*
+	 * 反向映射检查，遍历所有映射该folio的进程页表，统计引用计数
+	 */
 	referenced_ptes = folio_referenced(folio, 1, sc->target_mem_cgroup,
 					   &vm_flags);
+	/*
+	 * include/linux/page-flags.h:
+	 *	{ return test_and_set_bit(PG_##name, folio_flags(folio, page)); }
+	 *
+	 * 将folio的PG_referenced清0，并返回旧值
+	 * 第二次机会标志，表示folio在LRU链表上时曾被访问过
+	 * referenced_folio表示曾经被访问过
+	 */
 	referenced_folio = folio_test_clear_referenced(folio);
 
 	/*
 	 * The supposedly reclaimable folio was found to be in a VM_LOCKED vma.
 	 * Let the folio, now marked Mlocked, be moved to the unevictable list.
+	 */
+	/*
+	 * 1. mlock页面，一般是常驻内存，不能换出，放到unevictable list(待研究：后续如何放入？)
+	 *
+	 * 为什么这个判断不放在最前面？ 是不是要先清除掉PG_referenced?
+	 * 也不是，最新内核代码提前到folio_referenced后面了
+	 * 那为什么不直接放到最前面呢？还不用遍历映射
 	 */
 	if (vm_flags & VM_LOCKED)
 		return FOLIOREF_ACTIVATE;
@@ -880,6 +1008,13 @@ static enum folio_references folio_check_references(struct folio *folio,
 	 * 1) Rmap lock contention: rotate.
 	 * 2) Skip the non-shared swapbacked folio mapped solely by
 	 *    the exiting or OOM-reaped process.
+	 */
+	/*
+	 * 锁竞争处理：-1表示获取rmap锁失败
+	 * 一般发生在高并发场景，为了避免死锁，保持现状
+	 *
+	 * 这个应该也可以提前到folio_referenced()后面
+	 * 最新代码确实是提前了，但是在VM_LOCKED判断之后
 	 */
 	if (referenced_ptes == -1)
 		return FOLIOREF_KEEP;
@@ -899,25 +1034,79 @@ static enum folio_references folio_check_references(struct folio *folio,
 		 * so that recently deactivated but used folios are
 		 * quickly recovered.
 		 */
+		/*
+		 * 只要referenced_ptes大于0，都设置PG_referenced
+		 * 体现第二次机会，即使这次不激活，下次也有机会
+		 */
 		folio_set_referenced(folio);
 
+		/*
+		 * 2. inactive->active，近期被多次访问
+                 * a.之前已经被设置过PG_ref，就算这时referenced_ptes只为1，也可以加入active list；
+                 * b.没有被设置过PG_referenced，但是referenced_ptes大于1，也加入active；
+		 */
 		if (referenced_folio || referenced_ptes > 1)
 			return FOLIOREF_ACTIVATE;
 
 		/*
 		 * Activate file-backed executable folios after first usage.
 		 */
+		/*
+		 * 3. inactive->active:
+		 * 如果referenced_ptes大于0，且是可执行的file页面，比如动态库，也加入active；
+		 * 原因：
+		 *	代码执行通常具有局部性，很快会再次使用；
+		 *	从磁盘重新加载代码的I/O代价很高；
+		 */
 		if ((vm_flags & VM_EXEC) && folio_is_file_lru(folio))
 			return FOLIOREF_ACTIVATE;
 
+		/*
+		 * 4. 保持在inactive(移动到inactive链表头部)：referenced_ptes为1，且PG_referenced为0
+		 *
+		 * 如果一个文件的pagecache只被访问过一次，就都可以被加入active list，那会增加active list的压力，导致回收变慢
+		 * 这种这种情况下，只是将该页面的PG_referenced置上，并且将其从inactive list的链表尾部移动到链表头部
+		 * 这样的话，如果后面该页面被再次访问（referenced_ptes为1），则可以加入active list，如上面的2-a
+		 */
 		return FOLIOREF_KEEP;
 	}
 
 	/* Reclaim if clean, defer dirty folios to writeback */
+	/*
+	 * 如果只是曾经被访问过的文件页面（没有被引用）
+	 * 后续判断是否是clean的，如果是则直接回收；
+	 * 如果是dirty的，先写回，再回收
+	 */
 	if (referenced_folio && folio_is_file_lru(folio))
 		return FOLIOREF_RECLAIM_CLEAN;
 
+	/*
+	 *  可以被回收:
+	 *	a.没有被引用的匿名页面
+	 *	b.没有被引用、且最近没被访问过的文件页面(脏页需要先写回)
+	 */
 	return FOLIOREF_RECLAIM;
+
+	/*
+	 * 这里会有一个疑问:
+	 *	FOLIOREF_RECLAIM_CLEAN: 表示预期的干净的，可以被快速回收，fast path;
+	 *	FOLIOREF_RECLAIM: 回收时如果是ditry，需要writeback再回收，slow path;
+	 *
+	 *	引用计数为0的情况下，为什么最近被访问的文件页面用的是FOLIOREF_RECLAIM_CLEAN，
+	 *	而没被访问过的文件页面用的是FOLIOREF_RECLAIM？
+	 *	最近被访问过是不是可能是写操作、变为ditry了，怎么用FOLIOREF_RECLAIM_CLEAN、预期是干净的呢？
+	 *
+	 * 主要是没有被引用，说明文件很可能被释放了，比如文件读取文件后关闭文件，这时页面是赶紧且可安全回收的,
+	 * 就算后面页面又变脏了，skrink_folio_list中也会做双重检查
+	 * 而如果是写文件，写入后页面变脏，需要写回，这时候页面还有映射，就算写回完成后，页面也可能映射着，也就是有被引用
+	 *
+	 * 脏页的处理：通过其他机制（如周期性写回）不会进入FOLIOREF_RECLAIM_CLEAN路径
+	 *
+	 * PG_referenced标志表示"曾经访问"，不表示"正在使用"
+	 * 无页表引用表明资源已释放，页面可能已闲置
+	 * 脏页有专门机制处理，不会混淆到干净页面路径
+	 * 这种设计让内存回收器能够快速识别和回收那些短暂使用后就被放弃的干净缓存页面，从而高效地释放内存而几乎不产生I/O开销。
+	 */
 }
 
 /* Check if a folio is dirty or under writeback */
@@ -1042,21 +1231,100 @@ static bool may_enter_fs(struct folio *folio, gfp_t gfp_mask)
 /*
  * shrink_folio_list() returns the number of reclaimed pages
  */
+/*
+ * keep                  : 将folio放入ret_folios，后续放回LRU inctive链表;
+ * keep_locked           : 先将folio解锁，将folio放入ret_folios，后续放回LRU inctive链表;
+ * activate_locked       : 先将folio解锁，判断是否需要释放swap空间，非mlock页面设置PG_active，
+ *                         再将folio放入ret_folios，后续放回LRU inactive链表;
+ * activate_locked_split : 先更新分割后的页面计数，后面和active_locked一样;
+ *
+ * shrink_folio_list流程
+	- 逐步从folio_list尾部取出一个folio;
+	- 尝试上锁，lock失败则保留页面，跳转到keep;
+	- 如果是unevictable页面，则激活页面，跳转到active_locked;
+	- 如果sc不允许解除映射，且刚好是mapped页面，也保留页面，跳转到keep_locked;
+	- 如果使能了MGLRU，且是mapped页面、最近又被访问过，则保留页面，跳转keep_locked，后续MGLRU会处理;
+	- 获取folio的dirty和writeback标志，更新相关统计参数;
+	- 如果folio正在writeback
+		- case1, 刚好是kswap流程，且有PG_reclaim标志，则激活页面，跳转到activate_locked;
+		         这个folio可能因为I/O错误或者磁盘断开问题迟迟无法完成writeback ,导致无法完成回收而一直在LRU链表循环;
+		- case2, 如果不是kswap流程，且没有PG_reclaim，则设置PG_reclaim，激活页面，跳转到activate_locked;
+		- case3, 如果不是kswap流程，且有PG_reclaim, folio_wait_writeback()加入等待队列等待writeback完成，
+		         完成后放回folio_list下个循环再尝试回收;
+	- **folio_check_references()**，获取folio引用计数，返回回收策略
+		- case FOLIOREF_ACTIVATE:
+			mlcok页面、引用计数大于1、引用计数为1但最近被访问过的页面;
+			设置PG_active，激活页面，跳转到active_loced, 最后会放回LRU active链表；
+		- case FOLIOREF_KEEP:
+			获取rmap锁失败、引用计数为1但最近没被访问过的页面;
+			保留页面，跳转到keep_locked，最后会放回LRU inactive链表;
+		- case FOLIOREF_RECLAIM:
+			引用计数为0的匿名页、引用计数为0但最近没被访问过的文件页面;
+			继续往下走，尝试回收;
+		- case FOLIOREF_RECLAIM_CLEAN:
+			引用计数为0但最近被访问过的文件页面;
+			继续往下走，尝试回收;
+	- 如果当前node支持降级，则将thp和大页加入降级链表demote_folios，后续处理；
+	- 如果是可以swap的匿名页面，并且还没被swap, 则尝试为其分配swap空间;
+		- 如果没有IO权限、或者dma pinned, 则保留页面；
+		- 如果是大页，但是不能分割、或者split_folio_to_list分割失败，则激活页面；
+		- add_to_swap()，为分割成功的页面分配swap空间；
+		- 如果是普通页面分配swap空间失败，则跳转activate_locked_split，激活页面；
+		- 如果是大页分配swap失败，再次尝试分割，分割失败跳转activate_locked;
+		- 分割成功，再次尝试分配swap，如果还是失败了，还跳转activate_locked_split;
+	- 如果folio是mapped的，则尝试unmap;
+		- **try_to_unmap()**, 解除folio的所有映射, unmap失败则激活，跳转activate_locked;
+		- 成功unmap, 则继续往下回收；
+	- 如果folio是dirty的，则需要判断是否能回收，可以的回收的话需要writeback;
+		- 如果是文件页面、且(不是kswap流程 或 没有PG_reclaim 或LRU链表有很多dirty页面)，则不writeback;
+			- 设置PG_reclaim，激活页面，跳转activate_locked;
+			- 只有kswap可以回写，不然容易栈溢出;
+		- 如果是匿名页面，或者kswap流程中、有设置PG_reclaim 、LRU没有很多ditry页面的文件页面，可以writeback;
+			- 如果references是FOLIOREF_RECLAIM_CLEAN，则激活页面;
+			- 如果没有FS权限、或sc不支持wirteback，则保留页面;
+			- 调用**pageout()**, 回写页面;
+				- case PAGE_KEEP:
+					如果是不可释放的页面 或者无法处理的orphand, 则保留页面；
+				- case PAGE_ACTIVATE:
+					如果没有对应的writeback处理接口 或 writebck过程中决定激活, 则激活页面;
+				- case PAGE_SUCCESS:
+					成功发起了writeback，如果writeback没完成，则保留页面，下次处理；
+					如果writeback完成后有变成dirty了，还是保留页面；
+					成功writeback，则继续往下回收；
+	- 如果folio有对应的buffer缓存，则尝试释放；
+		- 调用**filemap_release_folio()**释放缓存，失败则激活页面；
+		- 释放缓存成功，判断如果没有mapping且引用计数为1（只有隔离引用），跳转free_it进行内存回收；
+	- 如果是匿名页但没有swapbacked，如果引用计数为1，则继续往下回收，如果不为1，则保留页面；
+	- 如果没有mapping的页面，则保留页面；
+	- 如果有mappig，调用**__remove_mapping()**，从页面缓存和交换缓存中移除folio，失败则保留页面；
+	- 走到这里，意味着folio已经从缓存中成功移除，可以释放了，free_it:
+		- 先unlock folio;
+		- 调用**folio_batch_add**，下降folio加入批量释放链表free_folios;
+		- 攒够一定数量或链表满后, 调用**free_unref_folios**释放free_folios链表的页面；
+		- continue处理下一个folio;
+	- 遍历处理完folio_list的所有页面后，开始处理demote_folios和ret_folios链表;
+	- 调用**demote_folio_list()**, 迁移需要降级的页面到其它node，对于本地node也算是回收；
+	- 降级失败的页面重新放回folio_list;
+	- 处理free_it没释放的页面（数量不够进行批量释放），还是调用free_unref_folios()释放；
+	- 将ret_folios放回folio_list，返回后调用者会将其放回LRU链表；
+	- 最后返回成功回收的页面数量；
+ */
 static unsigned int shrink_folio_list(struct list_head *folio_list,
 		struct pglist_data *pgdat, struct scan_control *sc,
 		struct reclaim_stat *stat, bool ignore_references)
 {
 	struct folio_batch free_folios;
-	LIST_HEAD(ret_folios);
-	LIST_HEAD(demote_folios);
-	unsigned int nr_reclaimed = 0;
-	unsigned int pgactivate = 0;
-	bool do_demote_pass;
+	LIST_HEAD(ret_folios);		// 存放回收失败、需要放回LRU链表的页面
+	LIST_HEAD(demote_folios);	// 存放回收失败、且需要降级的页面
+	unsigned int nr_reclaimed = 0;	// 记录成功回收的页面数
+	unsigned int pgactivate = 0;	// 记录被重新激活的页面数
+	bool do_demote_pass;		// 是否允许降级
 	struct swap_iocb *plug = NULL;
 
 	folio_batch_init(&free_folios);
 	memset(stat, 0, sizeof(*stat));
 	cond_resched();
+	/* 检查当前节点是否允许进行内存降级（demotion），并且扫描控制结构未明确禁止 */
 	do_demote_pass = can_demote(pgdat->node_id, sc);
 
 retry:
@@ -1067,11 +1335,19 @@ retry:
 		bool dirty, writeback;
 		unsigned int nr_pages;
 
+		/* 主动调度，避免长时间占用CPU */
 		cond_resched();
 
+		/* 从folio_list尾部取出一个folio */
 		folio = lru_to_folio(folio_list);
+		/* 将该folio从folio_list链表删除 */
 		list_del(&folio->lru);
 
+		/*
+		 * 尝试锁定该folio
+		 * 如果失败说明被其它线程锁定了, 则跳过，跳转到**keep**
+		 * 将其放到ret_folios链表(最后放回LRU链表)
+		 */
 		if (!folio_trylock(folio))
 			goto keep;
 
@@ -1082,13 +1358,27 @@ retry:
 		/* Account the number of base pages */
 		sc->nr_scanned += nr_pages;
 
+		/*
+		 * 如果是unevictable的页面，则跳过，跳转到**activate_locked**
+		 * 先判断是否需要释放其交换空间
+		 * 再将folio解锁, 设置PG_active, 将其放入ret_folios(最后放到LRU active链表, 升级)
+		 */
 		if (unlikely(!folio_evictable(folio)))
 			goto activate_locked;
 
+		/*
+		 * 和隔离页面时一样判断映射情况
+		 * 如果扫描控制不允许解除映射，但此时folio有映射，跳过，跳转到**keep_locked**
+		 * 将folio解锁，再将其放入ret_folios(最后放回LRU invative链表)
+		 */
 		if (!sc->may_unmap && folio_mapped(folio))
 			goto keep_locked;
 
 		/* folio_update_gen() tried to promote this page? */
+		/*
+		 * 如果使能了MGLRU + 不忽略引用计数 + folio有映射 + 最近被访问过
+		 * 则跳过，保留页面，后续MGLRU会处理（待研究）
+		 */
 		if (lru_gen_enabled() && !ignore_references &&
 		    folio_mapped(folio) && folio_test_referenced(folio))
 			goto keep_locked;
@@ -1098,18 +1388,26 @@ retry:
 		 * reclaim_congested. kswapd will stall and start writing
 		 * folios if the tail of the LRU is all dirty unqueued folios.
 		 */
+		/*
+		 * 太多diryt和writeback的页面会引起回收拥堵reclaim_congested
+		 * 如果LRU链表尾部全是dirty且没排队回写的页面，kswap会被堵塞并开始回写
+		 */
 		folio_check_dirty_writeback(folio, &dirty, &writeback);
 		if (dirty || writeback)
-			stat->nr_dirty += nr_pages;
+			stat->nr_dirty += nr_pages; // 统计脏页和回写页
 
 		if (dirty && !writeback)
-			stat->nr_unqueued_dirty += nr_pages;
+			stat->nr_unqueued_dirty += nr_pages;	// 统计ditry但未加入回写队列的页面
 
 		/*
 		 * Treat this folio as congested if folios are cycling
 		 * through the LRU so quickly that the folios marked
 		 * for immediate reclaim are making it to the end of
 		 * the LRU a second time.
+		 */
+		/*
+		 * 如果folio正在回写且已经被标记为回收(folio_set_reclaim()，后面的流程)
+		 * 说明回收速度过快？待研究
 		 */
 		if (writeback && folio_test_reclaim(folio))
 			stat->nr_congested += nr_pages;
@@ -1160,13 +1458,27 @@ retry:
 		 */
 		if (folio_test_writeback(folio)) {
 			/* Case 1 above */
+			/*
+			 * 在kswap流程中，如果folio正在writeback而且已经被标记为reclaim
+			 * 这个folio可能因为I/O错误或者磁盘断开问题迟迟无法完成writeback
+			 * 导致无法完成回收而一直在LRU链表循环
+			 * 为了避免堆积太多这类页面，直接激活它
+			 */
 			if (current_is_kswapd() &&
 			    folio_test_reclaim(folio) &&
 			    test_bit(PGDAT_WRITEBACK, &pgdat->flags)) {
-				stat->nr_immediate += nr_pages;
+				stat->nr_immediate += nr_pages;		// 记录需要被立刻激活的页面数
 				goto activate_locked;
 
 			/* Case 2 above */
+			/*
+			 * 如果是全局回收或者是新memcg回收
+			 * 遇到正在writeback且还没有设置reclaim的页面
+			 * 先标记reclaim标志，再放回LRU链表
+			 * 可能等到下次回收，writeback就完成了，可以被回收
+			 *
+			 * writeback_throttling_sane(): 待研究
+			 */
 			} else if (writeback_throttling_sane(sc) ||
 			    !folio_test_reclaim(folio) ||
 			    !may_enter_fs(folio, sc->gfp_mask)) {
@@ -1184,13 +1496,20 @@ retry:
 				 * avoid OOM; and it's also appropriate
 				 * in global reclaim.
 				 */
+				/* 设置PG_reclaim，下次遇到会等待writeback完成(else分支) */
 				folio_set_reclaim(folio);
 				stat->nr_writeback += nr_pages;
 				goto activate_locked;
 
 			/* Case 3 above */
+			/*
+			 * 如果是传统memcg
+			 * 遇到正在writeback且设置了reclaim的页面，会等待writeback完成
+			 * 再放回folio_list，下个循环再尝试回收
+			 */
 			} else {
 				folio_unlock(folio);
+				/* 加入等待队列，等待folio writeback完成 */
 				folio_wait_writeback(folio);
 				/* then go back and try same folio again */
 				list_add_tail(&folio->lru, folio_list);
@@ -1198,17 +1517,30 @@ retry:
 			}
 		}
 
+		/*
+		 * 获取folio引用计数，返回回收策略
+		 */
 		if (!ignore_references)
 			references = folio_check_references(folio, sc);
 
 		switch (references) {
 		case FOLIOREF_ACTIVATE:
+			/*
+			 * mlcok页面、引用计数大于1、引用计数为1但最近被访问过的页面
+			 * 设置PG_active，最后会放回LRU active链表
+			 */
 			goto activate_locked;
 		case FOLIOREF_KEEP:
+			/* 获取rmap锁失败、引用计数为1但最近没被访问过的页面
+			 * 最后会放回LRU inactive链表头
+			 */
 			stat->nr_ref_keep += nr_pages;
 			goto keep_locked;
 		case FOLIOREF_RECLAIM:
+			/* 引用计数为0的匿名页、引用计数为0但最近没被访问过的文件页面 */
 		case FOLIOREF_RECLAIM_CLEAN:
+			/* 引用计数为0但最近被访问过的文件页面, 预期为clean的页面 */
+			/* 继续往下走，尝试回收 */
 			; /* try to reclaim the folio below */
 		}
 
@@ -1216,8 +1548,15 @@ retry:
 		 * Before reclaiming the folio, try to relocate
 		 * its contents to another node.
 		 */
+		/*
+		 * 在回收之前，如果当前node是允许降级的（do_demote_pass == ture）
+		 * 则尝试迁移folio到其它node，对当前node来说也算是回收释放了内存
+		 *
+		 * 只支持透明大页和非普通大页的页面
+		 */
 		if (do_demote_pass &&
 		    (thp_migration_supported() || !folio_test_large(folio))) {
+			/* 添加到降级链表, 后续统一处理 */
 			list_add(&folio->lru, &demote_folios);
 			folio_unlock(folio);
 			continue;
@@ -1228,31 +1567,51 @@ retry:
 		 * Try to allocate it some swap space here.
 		 * Lazyfree folio could be freed directly
 		 */
+		/*
+		 * PG_swapbacked表示该页面可以被swap到交换分区
+		 * PG_swapcache表示该页面已经被swap到交换分区
+		 * 这两个标志都用在匿名页和shmem
+		 * PG_swapbacked在内存回收的作用是防止数据丢失，也就是回收页面之前要swap
+		 *
+		 * 如果是可以swap的匿名页面，并且还没被swap, 则为其分配swap空间
+		 */
 		if (folio_test_anon(folio) && folio_test_swapbacked(folio)) {
 			if (!folio_test_swapcache(folio)) {
+				/* 没有IO权限，放回LRU invative链表 */
 				if (!(sc->gfp_mask & __GFP_IO))
 					goto keep_locked;
+				/* dma pinned(待研究)，放回LRU invative链表 */
 				if (folio_maybe_dma_pinned(folio))
 					goto keep_locked;
 				if (folio_test_large(folio)) {
 					/* cannot split folio, skip it */
+					/* 如果不能分割则激活，放到LRU active链表(是不是一直无法回收了？) */
 					if (!can_split_folio(folio, 1, NULL))
 						goto activate_locked;
 					/*
 					 * Split partially mapped folios right away.
 					 * We can free the unmapped pages without IO.
 					 */
+					/*
+					 * 分割页面, 可以先释放那些没有映射且无需IO的页面
+					 * 分割失败则激活
+					 */
 					if (data_race(!list_empty(&folio->_deferred_list) &&
 					    folio_test_partially_mapped(folio)) &&
 					    split_folio_to_list(folio, folio_list))
 						goto activate_locked;
 				}
+				/*
+				 * 分割成功，则尝试分配swap空间
+				 */
 				if (!add_to_swap(folio)) {
 					int __maybe_unused order = folio_order(folio);
 
+					/* 如果普通页面(非大页)分配swap空间失败，则激活 */
 					if (!folio_test_large(folio))
 						goto activate_locked_split;
 					/* Fallback to swap normal pages */
+					/* 大页分割失败，则激活 */
 					if (split_folio_to_list(folio, folio_list))
 						goto activate_locked;
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
@@ -1263,6 +1622,7 @@ retry:
 					}
 					count_mthp_stat(order, MTHP_STAT_SWPOUT_FALLBACK);
 #endif
+					/* 再次为分割后的页面分配swap空间，失败则激活 */
 					if (!add_to_swap(folio))
 						goto activate_locked_split;
 				}
@@ -1274,6 +1634,11 @@ retry:
 		 * their own pass through this function and be accounted
 		 * then.
 		 */
+		/*
+		 * 前面分割了大页，则需要更新nr_scanned计数，避免重复计算
+		 * 分割后的folio可能是普通页(一个页面)，也可能还是大页
+		 * 因为除了首folio(本次)，其余folio会再走一次循环
+		 */
 		if ((nr_pages > 1) && !folio_test_large(folio)) {
 			sc->nr_scanned -= (nr_pages - 1);
 			nr_pages = 1;
@@ -1283,10 +1648,12 @@ retry:
 		 * The folio is mapped into the page tables of one or more
 		 * processes. Try to unmap it here.
 		 */
+		/* 尝试unmap folio, 成功继续往下，失败则激活 */
 		if (folio_mapped(folio)) {
 			enum ttu_flags flags = TTU_BATCH_FLUSH;
 			bool was_swapbacked = folio_test_swapbacked(folio);
 
+			/* 如果是PMD可映射的大页，需要分割PMD(待研究) */
 			if (folio_test_pmd_mappable(folio))
 				flags |= TTU_SPLIT_HUGE_PMD;
 			/*
@@ -1301,18 +1668,24 @@ retry:
 			 * try_to_unmap acquire PTL from the first PTE,
 			 * eliminating the influence of temporary PTE values.
 			 */
+			 /* 对于大页，设置TTU_SYNC有助于从第一个PTE开始获取PTL，消除临时PTE值的影响(new) */
 			if (folio_test_large(folio))
 				flags |= TTU_SYNC;
 
+			/* **尝试解除folio的所有映射** */
 			try_to_unmap(folio, flags);
+			/* unmap失败，更新失败计数，并激活folio */
 			if (folio_mapped(folio)) {
 				stat->nr_unmap_fail += nr_pages;
+				/* 原本不是swapbacked，但现在又是了 */
 				if (!was_swapbacked &&
 				    folio_test_swapbacked(folio))
 					stat->nr_lazyfree_fail += nr_pages;
 				goto activate_locked;
 			}
 		}
+
+		/* 这里开始，folio是unmap的了 */
 
 		/*
 		 * Folio is unmapped now so it cannot be newly pinned anymore.
@@ -1321,10 +1694,16 @@ retry:
 		 * if the folio is pinned and thus potentially modified by the
 		 * pinning process as that may upset the filesystem.
 		 */
+		/*
+		 * folio现在已经没有映射了，所以它不能再被新钉住（pinned）。
+		 * 如果folio可能被DMA钉住，不要回收它。
+		 */
 		if (folio_maybe_dma_pinned(folio))
 			goto activate_locked;
 
+		/* 获取folio的地址空间（对于文件页） */
 		mapping = folio_mapping(folio);
+		/* 如果folios是dirty的 */
 		if (folio_test_dirty(folio)) {
 			/*
 			 * Only kswapd can writeback filesystem folios
@@ -1336,6 +1715,17 @@ retry:
 			 * the rest of the LRU for clean folios and see
 			 * the same dirty folios again (with the reclaim
 			 * flag set).
+			 */
+			/*
+			 * 只有kswapd可以回写文件系统folio以避免栈溢出风险。
+			 * 但尽量避免将低效的单folio I/O注入flusher回写：
+			 * 只有当遇到许多脏folio，并且已经扫描完LRU其余部分寻找干净folio，
+			 * 并且再次看到相同的脏folio（设置了回收标志）时，才进行回写。
+			 */
+			/*
+			 * 如果是 dirty的文件页面 +
+			 * (当前不是kswap流程 or 没有PG_reclaim标志 or 当前LRU链表尾部没有很多dirty页面)
+			 * 则设置PG_reclaim标识(下次遇到再处理, 上面Case 3等wirteback完成)，并跳过，激活
 			 */
 			if (folio_is_file_lru(folio) &&
 			    (!current_is_kswapd() ||
@@ -1354,8 +1744,15 @@ retry:
 				goto activate_locked;
 			}
 
+			/* 往下: 匿名页面，或者kswap流程中、有设置PG_reclaim 、LRU没有很多ditry页面的文件页面 */
+
+			/*
+			 * 如果是引用计数为0但最近被访问过的文件页面
+			 * 本来预期是clean的，现在是dirty，则跳过，激活
+			 */
 			if (references == FOLIOREF_RECLAIM_CLEAN)
 				goto keep_locked;
+			/* 检查是否有FS操作权限, 因为需要往下writeback需要FS权限 */
 			if (!may_enter_fs(folio, sc->gfp_mask))
 				goto keep_locked;
 			if (!sc->may_writepage)
@@ -1366,15 +1763,28 @@ retry:
 			 * potentially exists to avoid CPU writes after I/O
 			 * starts and then write it out here.
 			 */
+			/* writeback之前，刷cache，确保内存的数据是最新的 */
 			try_to_unmap_flush_dirty();
+			/* 调用pageout()回写folio, 返回处理结果 */
 			switch (pageout(folio, mapping, &plug, folio_list)) {
 			case PAGE_KEEP:
+				/*
+				 * 不可释放的页面 或 无法处理的orphaned页面，
+				 * 则保留页面，放回LRU inactive链表
+				 */
 				goto keep_locked;
 			case PAGE_ACTIVATE:
+				/*
+				 * 没有对应的writeback处理接口 或 writebck过程中决定激活
+				 * 则激活页面，放到LRU active链表
+				 */
 				/*
 				 * If shmem folio is split when writeback to swap,
 				 * the tail pages will make their own pass through
 				 * this function and be accounted then.
+				 */
+				/*
+				 * 如果shmem folio在回写到交换时被分割，需要重新计算
 				 */
 				if (nr_pages > 1 && !folio_test_large(folio)) {
 					sc->nr_scanned -= (nr_pages - 1);
@@ -1382,26 +1792,38 @@ retry:
 				}
 				goto activate_locked;
 			case PAGE_SUCCESS:
+				/* 成功发起writback, 重新计算相关统计 */
 				if (nr_pages > 1 && !folio_test_large(folio)) {
 					sc->nr_scanned -= (nr_pages - 1);
 					nr_pages = 1;
 				}
 				stat->nr_pageout += nr_pages;
 
+				/* writeback还没完成，则保留，放回LRU inactive链表，下次处理 */
 				if (folio_test_writeback(folio))
 					goto keep;
+				/* 如果writeback完成后，又变dirty了，还是保留 */
 				if (folio_test_dirty(folio))
 					goto keep;
+
+				/* 这里往下是writeback完成了，并且页面是clean的 */
 
 				/*
 				 * A synchronous write - probably a ramdisk.  Go
 				 * ahead and try to reclaim the folio.
 				 */
+				/*
+				 * 尝试加锁，加锁失败则无法回收，保留页面
+				 * 待办: 前面流程中哪里folio_unlock了？
+				 *       研究folio_lock具体流程
+				 */
 				if (!folio_trylock(folio))
 					goto keep;
+				/* 再次检查状态,  */
 				if (folio_test_dirty(folio) ||
 				    folio_test_writeback(folio))
 					goto keep_locked;
+				/* 重新获取mapping（可能因回写变化？） */
 				mapping = folio_mapping(folio);
 				fallthrough;
 			case PAGE_CLEAN:
@@ -1432,13 +1854,22 @@ retry:
 		 * (refcount == 1) it can be freed.  Otherwise, leave
 		 * the folio on the LRU so it is swappable.
 		 */
+		/*
+		 * 如果folio有对应的buffer_head缓存，则尝试释放与其映射的buffer
+		 */
 		if (folio_needs_release(folio)) {
+			/*
+			 * 尝试释放folio对应的缓存，失败则将folio激活
+			 */
 			if (!filemap_release_folio(folio, sc->gfp_mask))
 				goto activate_locked;
+			/* 如果没有mapping且引用计数为1（只有隔离引用），可以尝试释放 */
 			if (!mapping && folio_ref_count(folio) == 1) {
 				folio_unlock(folio);
+				/* 如果put之后引用计数为0，则释放 */
 				if (folio_put_testzero(folio))
 					goto free_it;
+				/* 否则直接增加回收数据，后续会很快被释放？待研究 */
 				else {
 					/*
 					 * rare race with speculative reference.
@@ -1453,8 +1884,12 @@ retry:
 			}
 		}
 
+		/* 处理匿名页但不是swapbacked的情况（可能是懒惰释放的folio？） */
 		if (folio_test_anon(folio) && !folio_test_swapbacked(folio)) {
 			/* follow __remove_mapping for reference */
+			/*
+			 * 尝试冻结引用计数为1，如果失败则保留页面
+			 */
 			if (!folio_ref_freeze(folio, 1))
 				goto keep_locked;
 			/*
@@ -1465,12 +1900,24 @@ retry:
 			 * which lru it goes on. So we don't bother checking
 			 * the dirty flag here.
 			 */
+			/*
+			 * Folio只剩下一个引用（来自隔离）。当调用者将folio放回LRU并放下引用后，
+			 * folio无论如何都会被释放。它进入哪个LRU并不重要。
+			 * 所以这里不检查脏标志。
+			 */
+			count_vm_events(PGLAZYFREED, nr_pages); // 统计懒惰释放事件
+			count_memcg_folio_events(folio, PGLAZYFREED, nr_pages); // memcg统计
 			count_vm_events(PGLAZYFREED, nr_pages);
 			count_memcg_folio_events(folio, PGLAZYFREED, nr_pages);
 		} else if (!mapping || !__remove_mapping(mapping, folio, true,
 							 sc->target_mem_cgroup))
+		/*
+		 * 对于文件页：调用__remove_mapping从页缓存和交换缓存中移除folio，
+		 * 失败则保留页面
+		 */
 			goto keep_locked;
 
+		/* 走到这里，意味着folio已经从缓存中成功移除，可以释放了 */
 		folio_unlock(folio);
 free_it:
 		/*
@@ -1479,12 +1926,16 @@ free_it:
 		 */
 		nr_reclaimed += nr_pages;
 
+		/* 处理延迟分割队列（如果folio是大页的一部分） */
 		folio_unqueue_deferred_split(folio);
+		/* 将folio加入批量释放链表，攒够一定数量或队列满后统一释放 */
 		if (folio_batch_add(&free_folios, folio) == 0) {
+			/* 批量释放：memcg uncharge，刷新TLB，然后释放folio */
 			mem_cgroup_uncharge_folios(&free_folios);
 			try_to_unmap_flush();
 			free_unref_folios(&free_folios);
 		}
+		/* 处理下一个folio */
 		continue;
 
 activate_locked_split:
@@ -1498,10 +1949,16 @@ activate_locked_split:
 		}
 activate_locked:
 		/* Not a candidate for swapping, so reclaim swap space. */
+		/* 处理mlock页面 */
+		/*
+		 * 如果folio有交换缓存，而且交换分区满了 或 folio被mlock
+		 * 则先释放其交换缓存空间
+		 */
 		if (folio_test_swapcache(folio) &&
 		    (mem_cgroup_swap_full(folio) || folio_test_mlocked(folio)))
 			folio_free_swap(folio);
 		VM_BUG_ON_FOLIO(folio_test_active(folio), folio);
+		/* 处理非mlock页面, 将其加入活跃链表 */
 		if (!folio_test_mlocked(folio)) {
 			int type = folio_is_file_lru(folio);
 			folio_set_active(folio);
@@ -1511,6 +1968,7 @@ activate_locked:
 keep_locked:
 		folio_unlock(folio);
 keep:
+		/* 将需要放回LRU的folio（回收失败、需激活、需保留等）加入ret_folios链表 */
 		list_add(&folio->lru, &ret_folios);
 		VM_BUG_ON_FOLIO(folio_test_lru(folio) ||
 				folio_test_unevictable(folio), folio);
@@ -1518,6 +1976,9 @@ keep:
 	/* 'folio_list' is always empty here */
 
 	/* Migrate folios selected for demotion */
+	/*
+	 * 迁移需要降级的页面，降级到其它node也算回收
+	 */
 	stat->nr_demoted = demote_folio_list(&demote_folios, pgdat);
 	nr_reclaimed += stat->nr_demoted;
 	/* Folios that could not be demoted are still in @demote_folios */
@@ -1547,17 +2008,28 @@ keep:
 		}
 	}
 
+	/* 计算总共激活的页面数（文件+匿名） */
 	pgactivate = stat->nr_activate[0] + stat->nr_activate[1];
 
+	/* 释放批量上述释放流程剩余的folio */
 	mem_cgroup_uncharge_folios(&free_folios);
 	try_to_unmap_flush();
 	free_unref_folios(&free_folios);
 
+	/*
+	 * 将ret_folios中的folio重新接回最初的folio_list，
+	 * 让调用者（shrink_inactive_list）将它们放回LRU
+	 */
+	/*
+	 * 将ret_folios中的folio重新放回最初的folio_list,
+	 * 让调用者(shrink_inactive_list)将它们放回LRU链表
+	 */
 	list_splice(&ret_folios, folio_list);
 	count_vm_events(PGACTIVATE, pgactivate);
 
 	if (plug)
 		swap_write_unplug(plug);
+	/* 返回成功回收的页面数 */
 	return nr_reclaimed;
 }
 
@@ -1649,18 +2121,25 @@ static __always_inline void update_lru_sizes(struct lruvec *lruvec,
  *
  * returns how many pages were moved onto *@dst.
  */
+/*
+ * 不参与隔离的几种页面
+ * 1.所在zone编号高于本次回收规定的最高zone的页面；
+ * 2.没有PG_lru标志的页面（并发隔离）；
+ * 3.如果sc不允许接触映射，但仍有映射的页面；
+ * 4.无法增加引用计数的页面（说明正在被释放）；
+ */
 static unsigned long isolate_lru_folios(unsigned long nr_to_scan,
 		struct lruvec *lruvec, struct list_head *dst,
 		unsigned long *nr_scanned, struct scan_control *sc,
 		enum lru_list lru)
 {
-	struct list_head *src = &lruvec->lists[lru];
+	struct list_head *src = &lruvec->lists[lru];	// 某个node的指定LRU链表头
 	unsigned long nr_taken = 0;
 	unsigned long nr_zone_taken[MAX_NR_ZONES] = { 0 };
 	unsigned long nr_skipped[MAX_NR_ZONES] = { 0, };
 	unsigned long skipped = 0;
 	unsigned long scan, total_scan, nr_pages;
-	LIST_HEAD(folios_skipped);
+	LIST_HEAD(folios_skipped);	// 临时链表，存放跳过/不合格的folio
 
 	total_scan = 0;
 	scan = 0;
@@ -1668,13 +2147,21 @@ static unsigned long isolate_lru_folios(unsigned long nr_to_scan,
 		struct list_head *move_to = src;
 		struct folio *folio;
 
+		/* 从LRU链表尾部取出一个folio */
 		folio = lru_to_folio(src);
+		/* 预取下一个folio的标志位，利用CPU缓存提高性能 */
 		prefetchw_prev_lru_folio(folio, src, flags);
 
 		nr_pages = folio_nr_pages(folio);
 		total_scan += nr_pages;
 
+		/*
+		 * 检查folio所在的zon是符合回收条件
+		 * 如果folio所在zone编号高于本次回收规定的最高zone，则跳过folio
+		 * 一般优先回收较低zone的页面
+		 */
 		if (folio_zonenum(folio) > sc->reclaim_idx) {
+			/* 移动到skik链表，最后再重新放回LRU链表 */
 			nr_skipped[folio_zonenum(folio)] += nr_pages;
 			move_to = &folios_skipped;
 			goto move;
@@ -1689,8 +2176,16 @@ static unsigned long isolate_lru_folios(unsigned long nr_to_scan,
 		 */
 		scan += nr_pages;
 
+		/*
+		 * 如果没有PG_lru标志，表示不在LRU链表中，说明有并发操作
+		 *
+		 * 但是为什么要跳转到move，还把它从LRU链表拿出来再放回去？(move_to为src，也就是LRU链表头)
+		 * 会不会又被返回LRU链表？（实验验证一下）这样不会影响另外一个已经把它隔离出来的流程吗？
+		 * **待研究**
+		 */
 		if (!folio_test_lru(folio))
 			goto move;
+		/* 如果扫描控制不允许解除映射，但folio有映射，则跳过 */
 		if (!sc->may_unmap && folio_mapped(folio))
 			goto move;
 
@@ -1699,9 +2194,18 @@ static unsigned long isolate_lru_folios(unsigned long nr_to_scan,
 		 * sure the folio is not being freed elsewhere -- the
 		 * folio release code relies on it.
 		 */
+		/* 尝试增加引用计数，失败说明folio正在被释放 */
 		if (unlikely(!folio_try_get(folio)))
 			goto move;
 
+		/*
+		 * 将folio的PG_lru清0，并返回旧值
+		 *
+		 * 返回0，表示清除失败，已经没有PG_lru标志了
+		 * 表示这个folio已经被其它线程隔离了
+		 *
+		 * 同上述 待研究
+		 */
 		if (!folio_test_clear_lru(folio)) {
 			/* Another thread is already isolating this folio */
 			folio_put(folio);
@@ -1712,6 +2216,10 @@ static unsigned long isolate_lru_folios(unsigned long nr_to_scan,
 		nr_zone_taken[folio_zonenum(folio)] += nr_pages;
 		move_to = dst;
 move:
+		/*
+		 * 将folio从LRU链表移除（进入isolate_lru_folios之前已经拿了LRU链表锁），
+		 * 并放入move_to链表的头部
+		 */
 		list_move(&folio->lru, move_to);
 	}
 
@@ -1725,6 +2233,7 @@ move:
 	if (!list_empty(&folios_skipped)) {
 		int zid;
 
+		/* 将folio_skipped链表添加到LRU链表头部 */
 		list_splice(&folios_skipped, src);
 		for (zid = 0; zid < MAX_NR_ZONES; zid++) {
 			if (!nr_skipped[zid])
@@ -1737,7 +2246,10 @@ move:
 	*nr_scanned = total_scan;
 	trace_mm_vmscan_lru_isolate(sc->reclaim_idx, sc->order, nr_to_scan,
 				    total_scan, skipped, nr_taken, lru);
+	/* 更新每个zone的lru size信息，/proc/zoneinfo */
 	update_lru_sizes(lruvec, lru, nr_zone_taken);
+
+	/* 返回成功隔离的页面数 */
 	return nr_taken;
 }
 
@@ -1790,18 +2302,47 @@ bool folio_isolate_lru(struct folio *folio)
  * the LRU list will go small and be scanned faster than necessary, leading to
  * unnecessary swapping, thrashing and OOM.
  */
+/*
+ * too_many_isolated() - 检查系统中是否有过多的隔离页，防止回收过程导致系统僵住
+ * @pgdat: 要检查的物理内存节点
+ * @file:  要检查的页面类型（true=文件页，false=匿名页）
+ * @sc:    扫描控制结构体，包含回收参数
+ *
+ * 返回值: true表示有过多隔离页，需要节流；false表示正常，可以继续回收
+ *
+ * 功能:
+ * 防止直接回收者因为隔离过多页面而导致系统问题。当直接回收从LRU链表隔离大量页面后
+ * 被调度出去，而系统中有大量任务在进行页面分配时，这些被隔离的页面会堆积在每个CPU上，
+ * 导致LRU链表变小并被过快扫描，从而引发不必要的交换、抖动甚至OOM。
+ *
+ * 原理:
+ * 通过比较 已隔离页面数 和 非活跃页面数 的比例来判断是否过度隔离。
+ * 如果隔离的数量超过了非活跃链表的一定比例，说明回收速度跟不上分配速度，需要节流。
+ *
+ * 进一步说明：
+ * 直接回收（Direct Reclaimer）是在分配内存时同步执行的回收过程。
+ * 它们会从LRU链表隔离页面（isolate_lru_folios），然后尝试回收（shrink_folio_list）。
+ * 如果在隔离后、回收前被调度出去，这些被隔离的页面就处于"既不在LRU中，也未被释放"的
+ * 中间状态。如果大量回收者都这样，就会堆积大量隔离页，导致LRU链表快速变空，触发更
+ * 激进的回收，形成恶性循环。
+ */
 static bool too_many_isolated(struct pglist_data *pgdat, int file,
 		struct scan_control *sc)
 {
 	unsigned long inactive, isolated;
 	bool too_many;
 
+	/* kswapd是后台回收线程，不需要受到此限制 */
 	if (current_is_kswapd())
 		return false;
-
+	/*
+	 * 对于传统memcg，其脏页节流机制不健全，为了避免死锁，不进行过多隔离检查。
+	 * 传统memcg的回收依赖于同步等待回写完成，而不是通过节流机制。
+	 */
 	if (!writeback_throttling_sane(sc))
 		return false;
 
+	/* 根据页面类型获取对应的非活跃页面数和已隔离页面数 */
 	if (file) {
 		inactive = node_page_state(pgdat, NR_INACTIVE_FILE);
 		isolated = node_page_state(pgdat, NR_ISOLATED_FILE);
@@ -1815,12 +2356,27 @@ static bool too_many_isolated(struct pglist_data *pgdat, int file,
 	 * won't get blocked by normal direct-reclaimers, forming a circular
 	 * deadlock.
 	 */
+	/*
+	 * GFP_NOIO/GFP_NOFS调用者被允许隔离更多页面，这样它们不会被正常的直接回收者阻塞          * 阻塞，从而避免形成循环死锁。
+	 *
+	 * 原理: GFP_NOIO/GFP_NOFS分配通常来自文件系统或块设备层，这些分配可能正在等待
+	 * 回收完成的页面。如果限制它们，可能导致死锁。因此给它们更高的隔离限额。
+	 */
 	if (gfp_has_io_fs(sc->gfp_mask))
 		inactive >>= 3;
 
+	/* 核心判断：如果已隔离页数大于非活跃页数，则认为过多 */
 	too_many = isolated > inactive;
 
 	/* Wake up tasks throttled due to too_many_isolated. */
+	/* 如果没有过多隔离，唤醒可能因too_many_isolated而节流的任务 */
+	/*
+	 * 当函数返回 true 时，调用者（如 shrink_inactive_list）会进入
+	 * reclaim_throttle(pgdat, VMSCAN_THROTTLE_ISOLATED)。
+	 * 节流会让当前回收者睡眠一段时间，等待其他回收者完成工作，减少隔离页数量。
+	 * 如果当前流程发现隔离页数减少（!too_many），会唤醒之前因为隔离页面过多被
+	 * 节流休眠的任务，当然当前流程也继续往下走，不会被节流。
+	 */
 	if (!too_many)
 		wake_throttle_isolated(pgdat);
 
@@ -1832,6 +2388,13 @@ static bool too_many_isolated(struct pglist_data *pgdat, int file,
  *
  * Returns the number of pages moved to the given lruvec.
  */
+/*
+ * 将list链表的页面直接加入LRU链表，而不是先加到cpu缓存
+ *
+ * 1.如果是unevictable页面直接加到LRU unevictable链表;
+ * 2.将folio引用计数减1，如果减去后为0，则直接释放(批量释放);
+ * 3.**lruvec_add_folio()**，将folio加入对应的LRU链表;
+ */
 static unsigned int move_folios_to_lru(struct lruvec *lruvec,
 		struct list_head *list)
 {
@@ -1840,9 +2403,11 @@ static unsigned int move_folios_to_lru(struct lruvec *lruvec,
 
 	folio_batch_init(&free_folios);
 	while (!list_empty(list)) {
+		/* 从要加入LRU链表的链表尾部取出一个folio */
 		struct folio *folio = lru_to_folio(list);
 
 		VM_BUG_ON_FOLIO(folio_test_lru(folio), folio);
+		/* 将folio从原来的链表删除 */
 		list_del(&folio->lru);
 		if (unlikely(!folio_evictable(folio))) {
 			spin_unlock_irq(&lruvec->lru_lock);
@@ -1864,6 +2429,10 @@ static unsigned int move_folios_to_lru(struct lruvec *lruvec,
 		 */
 		folio_set_lru(folio);
 
+		/*
+		 * 如果folio只有一个引用计数，那put之后可以直接释放
+		 * 将这个folio加入free_folios缓存，如果缓存满了，则直接释放
+		 */
 		if (unlikely(folio_put_testzero(folio))) {
 			__folio_clear_lru_flags(folio);
 
@@ -1883,6 +2452,7 @@ static unsigned int move_folios_to_lru(struct lruvec *lruvec,
 		 * inhibits memcg migration).
 		 */
 		VM_BUG_ON_FOLIO(!folio_matches_lruvec(folio, lruvec), folio);
+		/* 将folio直接加入对应的LRU链表，而不是percpu缓存 */
 		lruvec_add_folio(lruvec, folio);
 		nr_pages = folio_nr_pages(folio);
 		nr_moved += nr_pages;
@@ -1890,6 +2460,7 @@ static unsigned int move_folios_to_lru(struct lruvec *lruvec,
 			workingset_age_nonresident(lruvec, nr_pages);
 	}
 
+	/* 继续释放剩余的需要释放的folio */
 	if (free_folios.nr) {
 		spin_unlock_irq(&lruvec->lru_lock);
 		mem_cgroup_uncharge_folios(&free_folios);
@@ -1914,26 +2485,53 @@ static int current_may_throttle(void)
  * shrink_inactive_list() is a helper for shrink_node().  It returns the number
  * of reclaimed pages
  */
+/*
+ * shrink_inactive_list流程:
+	- **too_many_isolated()**, 判断是否存在太多隔离页面，
+		- 如果隔离页面数过多，则调用**reclaim_throttle()**休眠等待一次；
+		- 如果隔离页面数正常, 则继续往下；
+	- **lru_add_drain()**, 将cpu缓存的页面加入LRU链表；
+	- **isolate_lru_folios**，从LRU inactive链表的尾部隔离出指定数量的页面；
+	- **shrink_folio_list()**，尝试回收隔离出来的页面，返回成功回收的页面数量；
+	- **move_folios_to_lru()**, 将回收失败的页面重新放回LRU链表，
+		- 将folio直接加入对应的LRU链表(不是percpu缓存)，如果引用计数为1的, 则直接释放；
+	- 如果隔离出来的页面都是dirty但是没有加入writeback，则唤醒回写线程
+ */
 static unsigned long shrink_inactive_list(unsigned long nr_to_scan,
 		struct lruvec *lruvec, struct scan_control *sc,
 		enum lru_list lru)
 {
 	LIST_HEAD(folio_list);
 	unsigned long nr_scanned;
-	unsigned int nr_reclaimed = 0;
-	unsigned long nr_taken;
+	unsigned int nr_reclaimed = 0;	// 成功回收的页面数量
+	unsigned long nr_taken;		// 从LRU链表取出的页面数量
 	struct reclaim_stat stat;
 	bool file = is_file_lru(lru);
 	enum vm_event_item item;
 	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
 	bool stalled = false;
 
+	/*
+	 * 判断是否存在太多隔离页面，
+	 * 如果隔离页面不多，则唤醒之前因为隔离页面过多而休眠的线程，当前流程也继续往下走
+	 *
+	 * 隔离页面越多，不活跃LRU链表页面越少，容易引起系统问题
+	 * LRU链表越短、扫描越快，越容易造成激进的回收，引发不必要的交换、抖动甚至OOM
+	 */
 	while (unlikely(too_many_isolated(pgdat, file, sc))) {
+		/*
+		 * 只节流休眠等待一次，如果隔离页面满足条件被其它流程唤醒后，
+		 * 又多了很多隔离页面，导致隔离页面比例又过高，就直接返回了
+		 */
 		if (stalled)
 			return 0;
 
 		/* wait a bit for the reclaimer. */
 		stalled = true;
+		/*
+		 * 如果隔离页面比例过高，则进入节流休眠，等到当隔离页面减少时被其它流程唤醒
+		 * 在too_many_isolated()中被唤醒
+		 */
 		reclaim_throttle(pgdat, VMSCAN_THROTTLE_ISOLATED);
 
 		/* We are about to die and free our memory. Return now. */
@@ -1941,40 +2539,81 @@ static unsigned long shrink_inactive_list(unsigned long nr_to_scan,
 			return SWAP_CLUSTER_MAX;
 	}
 
+	/*
+	 * 将CPU缓存的LRU页面更新到对应的LRU链表中
+	 */
 	lru_add_drain();
 
+	/* 隔离之前拿LRU锁 */
 	spin_lock_irq(&lruvec->lru_lock);
 
+	/*
+	 * 从LRU链表中隔离出指定数量的页面, 放到folio_list中
+	 *
+	 * nr_taken: 实际隔离出的页面数量
+	 * nr_scanned: 实际扫描的总页面数量（包含不合格的页面）
+	 *
+	 * 不参与隔离的几种页面
+	 * 1.所在zone编号高于本次回收规定的最高zone的页面；
+	 * 2.没有PG_lru标志的页面（并发隔离）；
+	 * 3.如果sc不允许接触映射，但仍有映射的页面；
+	 * 4.无法增加引用计数的页面（说明正在被释放）；
+	 */
 	nr_taken = isolate_lru_folios(nr_to_scan, lruvec, &folio_list,
 				     &nr_scanned, sc, lru);
 
+	/* 更新节点的隔离页面数量 */
 	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, nr_taken);
+	/* 记录扫描事件，需要区分是kswap还是直接回收 */
 	item = PGSCAN_KSWAPD + reclaimer_offset();
+	/* 全局回收才记录全局事件 */
 	if (!cgroup_reclaim(sc))
 		__count_vm_events(item, nr_scanned);
+	/* 记录memcg相关的扫描事件 */
 	__count_memcg_events(lruvec_memcg(lruvec), item, nr_scanned);
+	/* 记录匿名/文件页的扫描事件 */
 	__count_vm_events(PGSCAN_ANON + file, nr_scanned);
 
+	/* 释放LRU锁 */
 	spin_unlock_irq(&lruvec->lru_lock);
 
+	/* 如果没有成功隔离出任何页面，直接返回 */
 	if (nr_taken == 0)
 		return 0;
 
+	/*
+	 * **回收核心**
+	 * 尝试回收隔离出来的页面，返回回收成功的页面数量
+	 * stat记录回收相关信息
+	 */
 	nr_reclaimed = shrink_folio_list(&folio_list, pgdat, sc, &stat, false);
 
 	spin_lock_irq(&lruvec->lru_lock);
+	/*
+	 * 将回收失败的页面重新放回LRU链表(而不是先加到percpu缓存),
+	 * 激活的放active链表，保留的还是放inactive链表
+	 * 引用计数为1的folio，则直接释放
+	 */
 	move_folios_to_lru(lruvec, &folio_list);
 
 	__mod_lruvec_state(lruvec, PGDEMOTE_KSWAPD + reclaimer_offset(),
 					stat.nr_demoted);
+	/* 再次更新节点的隔离页面数量 */
 	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, -nr_taken);
+	/* 记录回收成功事件: 区分kswapd和直接回收 */
 	item = PGSTEAL_KSWAPD + reclaimer_offset();
 	if (!cgroup_reclaim(sc))
 		__count_vm_events(item, nr_reclaimed);
 	__count_memcg_events(lruvec_memcg(lruvec), item, nr_reclaimed);
+	/* 记录匿名/文件页的回收事件 */
 	__count_vm_events(PGSTEAL_ANON + file, nr_reclaimed);
 	spin_unlock_irq(&lruvec->lru_lock);
 
+	/*
+	 * 计算此次回收的成本、效率，影响后续扫描优先级
+	 * nr_pageout: 回收过程中writebate的页面数
+	 * nr_scanned - nr_reclaimed: 扫描但未被回收的页面数
+	 */
 	lru_note_cost(lruvec, file, stat.nr_pageout, nr_scanned - nr_reclaimed);
 
 	/*
@@ -1988,7 +2627,18 @@ static unsigned long shrink_inactive_list(unsigned long nr_to_scan,
 	 * the flushers simply cannot keep up with the allocation
 	 * rate. Nudge the flusher threads in case they are asleep.
 	 */
+	/*
+	 * 待研究
+	 * 如果扫描的脏页没有加入回写队列，意味着flusher线程没有正常工作。
+	 * 这可能发生在：
+	 * 1. 内存压力在脏数据限制被突破和脏数据过期之前，就将脏页推到了LRU末尾
+	 * 2. 脏页比例的增长不是通过写入，而是通过内存压力回收所有干净缓存导致的
+	 * 3. flusher线程根本无法跟上分配速率
+	 * 在这种情况下，唤醒flusher线程。
+	 */
+	/* 隔离出来的页面都是 dirtyr但还没加入回写队列的页面 (dirty && !writeback) */
 	if (stat.nr_unqueued_dirty == nr_taken) {
+		/* 唤醒回写线程 */
 		wakeup_flusher_threads(WB_REASON_VMSCAN);
 		/*
 		 * For cgroupv1 dirty throttling is achieved by waking up
@@ -2003,6 +2653,7 @@ static unsigned long shrink_inactive_list(unsigned long nr_to_scan,
 			reclaim_throttle(pgdat, VMSCAN_THROTTLE_WRITEBACK);
 	}
 
+	/* 将本次回收的统计信息累加到扫描控制结构中 */
 	sc->nr.dirty += stat.nr_dirty;
 	sc->nr.congested += stat.nr_congested;
 	sc->nr.unqueued_dirty += stat.nr_unqueued_dirty;
@@ -2012,8 +2663,11 @@ static unsigned long shrink_inactive_list(unsigned long nr_to_scan,
 	if (file)
 		sc->nr.file_taken += nr_taken;
 
+	/* 记录跟踪事件，便于调试和性能分析 */
 	trace_mm_vmscan_lru_shrink_inactive(pgdat->node_id,
 			nr_scanned, nr_reclaimed, &stat, sc->priority, file);
+
+	/* 返回成功回收的页面数量 */
 	return nr_reclaimed;
 }
 
@@ -2033,6 +2687,19 @@ static unsigned long shrink_inactive_list(unsigned long nr_to_scan,
  *
  * The downside is that we have to touch folio->_refcount against each folio.
  * But we had to alter folio->flags anyway.
+ */
+/*
+ * 从LRU active链表中取出合适的页面加入inactive链表
+ *
+ * 1.**isolate_lru_folios()**，从LRU active链表隔离出指定数量的页面；
+ * 2.逐个编译folio
+	- 如果是unevictable页面，则直接加入LRU unevictable链表；
+	- 如果是引用计数为0且可执行的文件页面，则还是返回active链表；
+	- 将下面类型的页面加入inactive链表，需要清除PG_active
+		- 匿名页;
+		- 不可执行的文件页面;
+		- 可执行但没有引用计数为0的文件页面;
+ * 将l_active和l_inactive直接加入对应的LRU链表中
  */
 static void shrink_active_list(unsigned long nr_to_scan,
 			       struct lruvec *lruvec,
@@ -2054,6 +2721,19 @@ static void shrink_active_list(unsigned long nr_to_scan,
 
 	spin_lock_irq(&lruvec->lru_lock);
 
+	/*
+	 * 从指定的LRU链表尾部中隔离出指定数量的页面, 放到l_hold中
+	 *
+	 * nr_to_scan: 计划 扫描的页面
+	 * nr_taken: 实际隔离出的页面数量
+	 * nr_scanned: 实际扫描的总页面数量（包含不合格的页面）
+	 *
+	 * 不参与隔离的几种页面
+	 * 1.所在zone编号高于本次回收规定的最高zone的页面；
+	 * 2.没有PG_lru标志的页面（并发隔离）；
+	 * 3.如果sc不允许接触映射，但仍有映射的页面；
+	 * 4.无法增加引用计数的页面（说明正在被释放）；
+	 */
 	nr_taken = isolate_lru_folios(nr_to_scan, lruvec, &l_hold,
 				     &nr_scanned, sc, lru);
 
@@ -2069,9 +2749,12 @@ static void shrink_active_list(unsigned long nr_to_scan,
 		struct folio *folio;
 
 		cond_resched();
+		/* 从l_hold尾部取出一个folio */
 		folio = lru_to_folio(&l_hold);
+		/* 将取出的folio从l_hold链表删除 */
 		list_del(&folio->lru);
 
+		/* 将unevictable的页面放回对应的LRU链表 */
 		if (unlikely(!folio_evictable(folio))) {
 			folio_putback_lru(folio);
 			continue;
@@ -2086,6 +2769,9 @@ static void shrink_active_list(unsigned long nr_to_scan,
 		}
 
 		/* Referenced or rmap lock contention: rotate */
+		/*
+		 * 如果是引用计数不为0、且可执行的文件页面，则加入l_active链表
+		 */
 		if (folio_referenced(folio, 0, sc->target_mem_cgroup,
 				     &vm_flags) != 0) {
 			/*
@@ -2104,8 +2790,18 @@ static void shrink_active_list(unsigned long nr_to_scan,
 			}
 		}
 
+		/*
+		 * 将下面类型的页面加入inactive链表:
+		 *
+		 * 1.匿名页;
+		 * 2.不可执行的文件页面;
+		 * 3.可执行但没有引用计数为0的文件页面;
+		 */
+		/* 清除PG_active标志 */
 		folio_clear_active(folio);	/* we are de-activating */
+		/* 标记该folio正在被使用(工作集) */
 		folio_set_workingset(folio);
+		/* 加入l_inactive链表 */
 		list_add(&folio->lru, &l_inactive);
 	}
 
@@ -2114,6 +2810,9 @@ static void shrink_active_list(unsigned long nr_to_scan,
 	 */
 	spin_lock_irq(&lruvec->lru_lock);
 
+	/*
+	 * 将l_active和l_inactive直接加入对应的LRU链表中
+	 */
 	nr_activate = move_folios_to_lru(lruvec, &l_active);
 	nr_deactivate = move_folios_to_lru(lruvec, &l_inactive);
 
@@ -2189,14 +2888,23 @@ unsigned long reclaim_pages(struct list_head *folio_list)
 static unsigned long shrink_list(enum lru_list lru, unsigned long nr_to_scan,
 				 struct lruvec *lruvec, struct scan_control *sc)
 {
+	/* 如果是回收active链表 */
 	if (is_active_lru(lru)) {
+		/*
+		 * 检查是否允许回收活跃页面:
+		 * sc->may_deactivate 位图标识哪些类型的活跃链表可以回收
+		 * 1 << is_file_lru(lru) - 根据LRU类型(文件/匿名)生成对应的位掩码
+		 */
 		if (sc->may_deactivate & (1 << is_file_lru(lru)))
+			/* 收缩指定的LRU active链表 */
 			shrink_active_list(nr_to_scan, lruvec, sc, lru);
 		else
+			/* 标记跳过了活跃链表回收(可能因为系统压力不够大) */
 			sc->skipped_deactivate = 1;
 		return 0;
 	}
 
+	/* 回收LRU inactive 链表 */
 	return shrink_inactive_list(nr_to_scan, lruvec, sc, lru);
 }
 
@@ -7082,6 +7790,7 @@ static void kswapd_try_to_sleep(pg_data_t *pgdat, int alloc_order, int reclaim_o
 	if (freezing(current) || kthread_should_stop())
 		return;
 
+	/* 加入等待队列 */
 	prepare_to_wait(&pgdat->kswapd_wait, &wait, TASK_INTERRUPTIBLE);
 
 	/*
@@ -7174,7 +7883,7 @@ static int kswapd(void *p)
 {
 	unsigned int alloc_order, reclaim_order;
 	unsigned int highest_zoneidx = MAX_NR_ZONES - 1;
-	pg_data_t *pgdat = (pg_data_t *)p;
+	pg_data_t *pgdat = (pg_data_t *)p;	/* 当前内存node */
 	struct task_struct *tsk = current;
 	const struct cpumask *cpumask = cpumask_of_node(pgdat->node_id);
 
@@ -7344,6 +8053,7 @@ unsigned long shrink_all_memory(unsigned long nr_to_reclaim)
  */
 void __meminit kswapd_run(int nid)
 {
+	/* 根据mem node id获取mem node结构体 */
 	pg_data_t *pgdat = NODE_DATA(nid);
 
 	pgdat_kswapd_lock(pgdat);
@@ -7383,6 +8093,7 @@ static int __init kswapd_init(void)
 	int nid;
 
 	swap_setup();
+	/* per-mem_node kswapd thread */
 	for_each_node_state(nid, N_MEMORY)
  		kswapd_run(nid);
 	return 0;

@@ -236,8 +236,10 @@ int overcommit_policy_handler(const struct ctl_table *, int, void *, size_t *,
 /* test whether an address (unsigned long or pointer) is aligned to PAGE_SIZE */
 #define PAGE_ALIGNED(addr)	IS_ALIGNED((unsigned long)(addr), PAGE_SIZE)
 
+/* 从LRU链表尾部取出一个folio */
 static inline struct folio *lru_to_folio(struct list_head *head)
 {
+	/* head->prev, 获取链表最后一个成员，相当于list_last_entry() */
 	return list_entry((head)->prev, struct folio, lru);
 }
 

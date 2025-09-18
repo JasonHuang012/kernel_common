@@ -1,0 +1,37 @@
+# 结构体的变化
+
+- per-cpu lru缓存结构体：struct pagevec变成了struct folio_batch
+- 各类per-cpu lru缓存类型的集合结构体：struct lru_pvecs变成了struct cpu_fbatches
+
+
+# 哪些内存页面不会被放到LRU链表
+- 内核内存，比如slab内存、dma alloc内存、vmalloc内存；
+- ion内存
+- 预留的内存
+- 正在使用的内存
+- 进程栈
+
+LRU链表只管理匿名页面、文件页面、和不可驱逐页面。
+
+
+# PG_referenced 标志位则是表明 page 最近是否被使用过，PG_referenced是在什么时候设置的？
+
+调用接口folio_set_referenced
+
+folio_mark_accessed\mark_page_accessed
+
+疑问：
+在check_reference的时候，pte引用大于1都会设置PG_referenced，这种怎么能说是最近被使用过呢？
+这个流程下设置的GP_referenced是什么时候被清除呢？
+
+# refault
+
+当一个页面从LRU inactive链表被回收后（匿名页换出到磁盘，文件页写回磁盘），又再次被访问到，将会触发 page fault，需要将页面从磁盘换入。因为由 demand paging 或者 demand alloction 产生这个页面的时候已经有一次 page fault 了，所以这时的 page fault 被称为 refault。
+
+# 内核双向链表
+https://www.cnblogs.com/ronnydm/p/5547972.html
+
+# webs
+
+https://zhuanlan.zhihu.com/p/70964195
+https://blog.csdn.net/weixin_42730667/article/details/123363494

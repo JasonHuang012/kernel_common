@@ -192,12 +192,15 @@ static void folio_batch_move_lru(struct folio_batch *fbatch, move_fn_t move_fn)
 	struct lruvec *lruvec = NULL;
 	unsigned long flags = 0;
 
+	/* 逐个将缓存的folio加入LRU链表 */
 	for (i = 0; i < folio_batch_count(fbatch); i++) {
 		struct folio *folio = fbatch->folios[i];
 
 		folio_lruvec_relock_irqsave(folio, &lruvec, &flags);
+		/* 例如lru_add类缓存的处理函数是 lru_add() */
 		move_fn(lruvec, folio);
 
+		/* 设置PG_lru标志 */
 		folio_set_lru(folio);
 	}
 
@@ -206,6 +209,12 @@ static void folio_batch_move_lru(struct folio_batch *fbatch, move_fn_t move_fn)
 	folios_put(fbatch);
 }
 
+/*
+ * 将folio加入per-cpu folio缓存，如果缓存满了，则加入对应的LRU链表
+ *
+ * fbatch: cpu的folio缓存，例如folio_add_lru()的op传入为lru_add, 则是cpu的lru_add缓存组
+ * move_fn: cpu各类folio缓存对应的处理函数，比如lru_add类的处理函数就是lru_add()
+ */
 static void __folio_batch_add_and_move(struct folio_batch __percpu *fbatch,
 		struct folio *folio, move_fn_t move_fn,
 		bool on_lru, bool disable_irq)
@@ -215,6 +224,7 @@ static void __folio_batch_add_and_move(struct folio_batch __percpu *fbatch,
 	if (on_lru && !folio_test_clear_lru(folio))
 		return;
 
+	/* 增加引用计数 */
 	folio_get(folio);
 
 	if (disable_irq)
@@ -222,8 +232,17 @@ static void __folio_batch_add_and_move(struct folio_batch __percpu *fbatch,
 	else
 		local_lock(&cpu_fbatches.lock);
 
+	/*
+	 * 1.folio_batch_add()先将folio加入per-cpu folio缓存
+	 * 再调用folio_batch_space()判断缓存数组是否满了， 如果是则加入LRU链表
+	 *
+	 * 2.如果这个folio不止一个页面，也就是复合页，直接加到LRU链表
+	 * 3.如果lru缓存暂时被disable了()，也直接加到LRU链表
+	 *   待研究：什么场景下会被disable?
+	 */
 	if (!folio_batch_add(this_cpu_ptr(fbatch), folio) || folio_test_large(folio) ||
 	    lru_cache_disabled())
+		/* 如果缓存满了，则将当前cpu的folio缓存加入对应的LRU链表，this_cpu_ptr取当前cpu */
 		folio_batch_move_lru(this_cpu_ptr(fbatch), move_fn);
 
 	if (disable_irq)
@@ -638,6 +657,7 @@ static void lru_lazyfree(struct lruvec *lruvec, struct folio *folio)
  * Either "cpu" is the current CPU, and preemption has already been
  * disabled; or "cpu" is being hot-unplugged, and is already dead.
  */
+/* 刷新LRU链表: 将CPU缓存的各类LRU页面全部加入到对应的lru链表 */
 void lru_add_drain_cpu(int cpu)
 {
 	struct cpu_fbatches *fbatches = &per_cpu(cpu_fbatches, cpu);

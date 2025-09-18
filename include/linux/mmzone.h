@@ -603,8 +603,14 @@ static inline void lru_gen_soft_reclaim(struct mem_cgroup *memcg, int nid)
 
 #endif /* CONFIG_LRU_GEN */
 
+/*
+ * linux-4.8之前，LRU链表是挂载zone下面的，每个zone都有一个lruvec结构体
+ * 因为以前32位系统有ZONE_HIGH和ZONE_NORMAL之分，不同ZONE需要不同的回收优先级，所有才有了zone-lru，现在系统64位居多，不存在ZONE_HIGH，所以都改用node-lru。
+ *
+ * 现在LRU链表是挂载node下面的，也就是每个pg_data_t都有一个lruvec
+ */
 struct lruvec {
-	struct list_head		lists[NR_LRU_LISTS];
+	struct list_head		lists[NR_LRU_LISTS]; // LRU链表
 	/* per lruvec lru_lock for memcg */
 	spinlock_t			lru_lock;
 	/*
@@ -1293,6 +1299,7 @@ struct memory_failure_stats {
  * Memory statistics and page replacement data structures are maintained on a
  * per-zone basis.
  */
+/* 每个node都有一个pg_data_t */
 typedef struct pglist_data {
 	/*
 	 * node_zones contains just the zones for THIS node. Not all of the
