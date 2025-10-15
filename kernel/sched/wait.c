@@ -219,6 +219,12 @@ void __wake_up_pollfree(struct wait_queue_head *wq_head)
 
 /*
  * Note: we use "set_current_state()" _after_ the wait-queue add,
+ POLLFREE must have cleared the queue. */
+	WARN_ON_ONCE(waitqueue_active(wq_head));
+}
+
+/*
+ * Note: we use "set_current_state()" _after_ the wait-queue add,
  * because we need a memory barrier there on SMP, so that any
  * wake-function that tests for the wait-queue being active
  * will be guaranteed to see waitqueue addition _or_ subsequent
@@ -229,6 +235,9 @@ void __wake_up_pollfree(struct wait_queue_head *wq_head)
  * stops them from bleeding out - it would still allow subsequent
  * loads to move into the critical region).
  */
+/*
+ * 将当前进程加入等待队里，设置指定的等待状态，为后续的睡眠等待做准备
+ */
 void
 prepare_to_wait(struct wait_queue_head *wq_head, struct wait_queue_entry *wq_entry, int state)
 {
@@ -236,6 +245,7 @@ prepare_to_wait(struct wait_queue_head *wq_head, struct wait_queue_entry *wq_ent
 
 	wq_entry->flags &= ~WQ_FLAG_EXCLUSIVE;
 	spin_lock_irqsave(&wq_head->lock, flags);
+	/* 如果等待项 不在等待队列中，则加入；已经在队列就不用加入了 */
 	if (list_empty(&wq_entry->entry))
 		__add_wait_queue(wq_head, wq_entry);
 	set_current_state(state);

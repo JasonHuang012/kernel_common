@@ -3119,6 +3119,20 @@ static inline long __zone_watermark_unusable_free(struct zone *z,
  * one free page of a suitable size. Checking now avoids taking the zone lock
  * to check in the allocation paths if no pages are free.
  */
+/*
+ * 判断当前zone是否已经balanced
+ * 也即是当前zone的空闲内存是否满足水位线，是否可以让kswapd休眠
+ *
+ * 没平衡的条件：
+ *	- free内存低于高水位线+lowmem_reserve, not balanced
+ *	- free内存高于高水位线+lowmem_reserve的情况下
+ *		- high-order申请，这个high-order及更高order的buddy空闲链表中都没有空闲块，not balanced
+ *
+ * 平衡的条件：
+ *	free内存高于高水位线+lowmem_reserve的情况下
+ *		- 0-order申请, balanced
+ *		- high-order申请，至少在这个high-order及更高order的buddy空闲链表中要有一个空闲块, balanced
+ */
 bool __zone_watermark_ok(struct zone *z, unsigned int order, unsigned long mark,
 			 int highest_zoneidx, unsigned int alloc_flags,
 			 long free_pages)
@@ -3163,14 +3177,22 @@ bool __zone_watermark_ok(struct zone *z, unsigned int order, unsigned long mark,
 	 * are not met, then a high-order request also cannot go ahead
 	 * even if a suitable page happened to be free.
 	 */
+	/*
+	 * free内存低于高水位线+lowmem_reserve，则没平衡，kswapd需要继续回收
+	 */
 	if (free_pages <= min + z->lowmem_reserve[highest_zoneidx])
 		return false;
 
 	/* If this is an order-0 request then the watermark is fine */
+	/* 空闲内存大于高水位线+lowmem_reserve的情况下，如果是0-order申请, 则直接算平衡了 */
 	if (!order)
 		return true;
 
 	/* For a high-order request, check at least one suitable page is free */
+	/*
+	 * 空闲内存大于高水位线+lowmem_reserve的情况下，如果是high-order申请
+	 * 至少在这个high-order及更高的buddy空闲链表中要有一个空闲内存块，才算平衡
+	 */
 	for (o = order; o < NR_PAGE_ORDERS; o++) {
 		struct free_area *area = &z->free_area[o];
 		int mt;
@@ -6316,6 +6338,7 @@ static struct ctl_table page_alloc_sysctl_table[] = {
 		.extra1		= SYSCTL_ZERO,
 	},
 	{
+		/* 内存回收时，临时抬高水位线, 加强回收力度, boost_watermark */
 		.procname	= "watermark_boost_factor",
 		.data		= &watermark_boost_factor,
 		.maxlen		= sizeof(watermark_boost_factor),
@@ -6324,6 +6347,7 @@ static struct ctl_table page_alloc_sysctl_table[] = {
 		.extra1		= SYSCTL_ZERO,
 	},
 	{
+		/* 用于动态调整水位线 __setup_per_zone_wmarks */
 		.procname	= "watermark_scale_factor",
 		.data		= &watermark_scale_factor,
 		.maxlen		= sizeof(watermark_scale_factor),

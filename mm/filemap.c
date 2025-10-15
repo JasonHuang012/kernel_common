@@ -3298,6 +3298,7 @@ static vm_fault_t filemap_fault_recheck_pte_none(struct vm_fault *vmf)
  *
  * Return: bitwise-OR of %VM_FAULT_ codes.
  */
+/* 文件mmap的page fault */
 vm_fault_t filemap_fault(struct vm_fault *vmf)
 {
 	int error;

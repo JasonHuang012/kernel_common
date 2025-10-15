@@ -620,6 +620,7 @@ config TASKSTATS
 
 	  Say N if unsure.
 
+# 性能优化手段
 config TASK_DELAY_ACCT
 	bool "Enable per-task delay accounting"
 	depends on TASKSTATS

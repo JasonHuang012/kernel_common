@@ -18,6 +18,8 @@
 typedef unsigned int __bitwise gfp_t;
 #endif
 
+/* GFP: get free page */
+
 /*
  * In case of changes, please don't forget to update
  * include/trace/events/mmflags.h and tools/perf/builtin-kmem.c

@@ -648,6 +648,7 @@ static inline bool mem_cgroup_unprotected(struct mem_cgroup *target,
 		memcg == target;
 }
 
+/* 当前memcg内存使用低于low限制，则需要软保护, 条件回收 */
 static inline bool mem_cgroup_below_low(struct mem_cgroup *target,
 					struct mem_cgroup *memcg)
 {
@@ -658,6 +659,7 @@ static inline bool mem_cgroup_below_low(struct mem_cgroup *target,
 		page_counter_read(&memcg->memory);
 }
 
+/* 当前memcg内存使用低于min限制，则需要硬保护, 禁止回收 */
 static inline bool mem_cgroup_below_min(struct mem_cgroup *target,
 					struct mem_cgroup *memcg)
 {
@@ -737,6 +739,16 @@ void mem_cgroup_migrate(struct folio *old, struct folio *new);
  * Returns the lru list vector holding pages for a given @memcg &
  * @pgdat combination. This can be the node lruvec, if the memory
  * controller is disabled.
+ */
+/*
+ * 根据memcg和node, 获取对应的lruvec
+ *
+ * 疑问： 不是per-node lruvec吗？为啥还要根据memcg来获取
+ *
+ * 说明：(待研究)
+ * - 若未启用memcg，则直接返回node的全局lruvec（pgdat->__lruvec）。
+ * - 启用memcg时，返回memcg在该node上的私有lruvec（mem_cgroup_per_node->lruvec）。
+ * - 同时确保lruvec->pgdat指针与传入pgdat一致（node热插拔后需修正）。
  */
 static inline struct lruvec *mem_cgroup_lruvec(struct mem_cgroup *memcg,
 					       struct pglist_data *pgdat)

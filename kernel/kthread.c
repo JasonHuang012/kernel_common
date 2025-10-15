@@ -206,6 +206,10 @@ bool kthread_freezable_should_stop(bool *was_frozen)
 
 	might_sleep();
 
+	/*
+	 * 检查当前进程是否需要被冻结（系统休眠或者挂起）
+	 * 需要冻结，则进入"冰箱"
+	 */
 	if (unlikely(freezing(current)))
 		frozen = __refrigerator(true);
 

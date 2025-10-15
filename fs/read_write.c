@@ -546,6 +546,23 @@ ssize_t kernel_read(struct file *file, void *buf, size_t count, loff_t *pos)
 }
 EXPORT_SYMBOL(kernel_read);
 
+/*
+ * 读取文件，对应pagecache文件页面加入LRU inactive file list流程
+ *   vfs_read
+ *       -> generic_file_read_iter
+ *	    -> filemap_read
+ *	        -> filemap_get_pages
+ *	            -> filemap_create_folio
+ *			-> filemap_alloc_folio		// 页面分配时，默认没有设置PG_active
+ *	                -> filemap_add_folio
+ *		            -> folio_add_lru(folio);	// 这里也没有set active
+ *	                        -> folio_batch_add_and_move(folio, lru_add, false);
+ *				    -> __folio_batch_add_and_move
+ *				        -> folio_batch_move_lru
+ *			    	    	    -> lru_add
+ *					        -> lruvec_add_folio
+ *						    -> list_add(&folio->lru, &lruvec->lists[lru]);
+ */
 ssize_t vfs_read(struct file *file, char __user *buf, size_t count, loff_t *pos)
 {
 	ssize_t ret;
@@ -564,6 +581,7 @@ ssize_t vfs_read(struct file *file, char __user *buf, size_t count, loff_t *pos)
 		count =  MAX_RW_COUNT;
 
 	if (file->f_op->read)
+		/* generic_file_read_iter */
 		ret = file->f_op->read(file, buf, count, pos);
 	else if (file->f_op->read_iter)
 		ret = new_sync_read(file, buf, count, pos);

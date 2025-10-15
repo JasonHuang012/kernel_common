@@ -233,16 +233,15 @@ static void __folio_batch_add_and_move(struct folio_batch __percpu *fbatch,
 		local_lock(&cpu_fbatches.lock);
 
 	/*
-	 * 1.folio_batch_add()先将folio加入per-cpu folio缓存
-	 * 再调用folio_batch_space()判断缓存数组是否满了， 如果是则加入LRU链表
-	 *
-	 * 2.如果这个folio不止一个页面，也就是复合页，直接加到LRU链表
-	 * 3.如果lru缓存暂时被disable了()，也直接加到LRU链表
+	 * 1.folio_batch_add()先将folio加入per-cpu folio缓存,
+	 *   再调用folio_batch_space()判断缓存数组是否满了， 如果是则加入LRU链表;
+	 * 2.如果这个folio不止一个页面，也就是复合页，直接加到LRU链表;
+	 * 3.如果lru缓存暂时被disable了()，也直接加到LRU链表;
 	 *   待研究：什么场景下会被disable?
 	 */
 	if (!folio_batch_add(this_cpu_ptr(fbatch), folio) || folio_test_large(folio) ||
 	    lru_cache_disabled())
-		/* 如果缓存满了，则将当前cpu的folio缓存加入对应的LRU链表，this_cpu_ptr取当前cpu */
+		/* 将当前cpu的folio缓存加入对应的LRU链表，this_cpu_ptr取当前cpu */
 		folio_batch_move_lru(this_cpu_ptr(fbatch), move_fn);
 
 	if (disable_irq)

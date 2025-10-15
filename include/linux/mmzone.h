@@ -424,6 +424,9 @@ enum {
  * The number of pages in each generation is eventually consistent and therefore
  * can be transiently negative when reset_batch_size() is pending.
  */
+/*
+ * 理解MGLRU的关键结构体
+ */
 struct lru_gen_folio {
 	/* the aging increments the youngest generation number */
 	unsigned long max_seq;
@@ -604,10 +607,13 @@ static inline void lru_gen_soft_reclaim(struct mem_cgroup *memcg, int nid)
 #endif /* CONFIG_LRU_GEN */
 
 /*
- * linux-4.8之前，LRU链表是挂载zone下面的，每个zone都有一个lruvec结构体
- * 因为以前32位系统有ZONE_HIGH和ZONE_NORMAL之分，不同ZONE需要不同的回收优先级，所有才有了zone-lru，现在系统64位居多，不存在ZONE_HIGH，所以都改用node-lru。
+ * lruvec: lru list vector
  *
- * 现在LRU链表是挂载node下面的，也就是每个pg_data_t都有一个lruvec
+ * linux-4.8之前，LRU链表是挂载zone下面的，每个zone都有一个lruvec结构体
+ * 因为以前32位系统有ZONE_HIGH和ZONE_NORMAL之分，不同ZONE需要不同的回收优先级，
+ * 所有才有了zone-lru，现在系统64位居多，不存在ZONE_HIGH，所以都改用node-lru。
+ *
+ * 现在LRU链表是挂载node下面的，也就是每个pg_data_t(node)都有一个lruvec
  */
 struct lruvec {
 	struct list_head		lists[NR_LRU_LISTS]; // LRU链表
@@ -628,6 +634,7 @@ struct lruvec {
 	unsigned long			flags;
 #ifdef CONFIG_LRU_GEN
 	/* evictable pages divided into generations */
+	/* MGLRU, 按代划分可驱逐页面 */
 	struct lru_gen_folio		lrugen;
 #ifdef CONFIG_LRU_GEN_WALKS_MMU
 	/* to concurrently iterate lru_gen_mm_list */

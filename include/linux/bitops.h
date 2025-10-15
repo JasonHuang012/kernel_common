@@ -201,6 +201,10 @@ static __always_inline __s64 sign_extend64(__u64 value, int index)
 	return (__s64)(value << shift) >> shift;
 }
 
+/*
+ * 获取l最高有效位的序号
+ * - fls (0) = 0, fls (1) = 1, fls (0x80000000) = 32
+ */
 static inline unsigned int fls_long(unsigned long l)
 {
 	if (sizeof(l) == 4)

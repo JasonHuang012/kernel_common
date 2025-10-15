@@ -72,21 +72,26 @@ bool __refrigerator(bool check_kthr_stop)
 		bool freeze;
 
 		raw_spin_lock_irq(&current->pi_lock);
+		/* 设置进程状态位TASK_FROZEN */
 		WRITE_ONCE(current->__state, TASK_FROZEN);
 		/* unstale saved_state so that __thaw_task() will wake us up */
 		current->saved_state = TASK_RUNNING;
 		raw_spin_unlock_irq(&current->pi_lock);
 
 		spin_lock_irq(&freezer_lock);
+		/* 再次判断是否需要冻结，考虑停止信号 */
 		freeze = freezing(current) && !(check_kthr_stop && kthread_should_stop());
 		spin_unlock_irq(&freezer_lock);
 
+		/* 不需要冻结，则退出 */
 		if (!freeze)
 			break;
 
+		/* 标记被冻结，并进入休眠 */
 		was_frozen = true;
 		schedule();
 	}
+	/* 唤醒后，重新设置任务状态 */
 	__set_current_state(TASK_RUNNING);
 
 	pr_debug("%s left refrigerator\n", current->comm);

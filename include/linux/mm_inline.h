@@ -316,7 +316,7 @@ static inline bool lru_gen_del_folio(struct lruvec *lruvec, struct folio *folio,
 #endif /* CONFIG_LRU_GEN */
 
 /*
- * 将folio直接接到对应的LRU链表中(而不是先加到cpu缓存)
+ * 将folio直接接到对应的LRU链表中(这里不是加到cpu缓存)
  */
 static __always_inline
 void lruvec_add_folio(struct lruvec *lruvec, struct folio *folio)
