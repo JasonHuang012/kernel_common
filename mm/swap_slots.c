@@ -310,6 +310,7 @@ swp_entry_t folio_alloc_swap(struct folio *folio)
 	entry.val = 0;
 
 	if (folio_test_large(folio)) {
+		/* 如果是大页，且支持THP swap(待研究), 则分配连续的交换空间 */
 		if (IS_ENABLED(CONFIG_THP_SWAP))
 			get_swap_pages(1, &entry, folio_order(folio));
 		goto out;
@@ -324,8 +325,12 @@ swp_entry_t folio_alloc_swap(struct folio *folio)
 	 * The alloc path here does not touch cache->slots_ret
 	 * so cache->free_lock is not taken.
 	 */
+	/*
+	 * per-cpu交换缓存，减少全局锁竞争
+	 */
 	cache = raw_cpu_ptr(&swp_slots);
 
+	/* 尝试从当前cpu的交换缓存中分配swap slot */
 	if (likely(check_cache_active() && cache->slots)) {
 		mutex_lock(&cache->alloc_lock);
 		if (cache->slots) {
@@ -343,9 +348,15 @@ repeat:
 			goto out;
 	}
 
+	/*
+	 * 如果cpu的交换缓存分配不出空闲的交换条目，则直接从全局空间分配
+	 * 1，表示分配1个页面，0，表示普通页面
+	 */
 	get_swap_pages(1, &entry, 0);
 out:
+	/* memcg记账 */
 	if (mem_cgroup_try_charge_swap(folio, entry)) {
+		/* 记账失败，释放swap空间 */
 		put_swap_folio(folio, entry);
 		entry.val = 0;
 	}

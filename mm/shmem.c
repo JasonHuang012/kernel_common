@@ -1468,9 +1468,11 @@ static int shmem_writepage(struct page *page, struct writeback_control *wbc)
 	if (WARN_ON_ONCE(!wbc->for_reclaim))
 		goto redirty;
 
+        /* 检查是否被锁定或禁止交换 */
 	if (WARN_ON_ONCE((info->flags & VM_LOCKED) || sbinfo->noswap))
 		goto redirty;
 
+        /* 检查系统是否有交换空间 */
 	if (!total_swap_pages)
 		goto redirty;
 
@@ -1482,6 +1484,9 @@ static int shmem_writepage(struct page *page, struct writeback_control *wbc)
 	 * swapout of a large folio crossing i_size needs to split too
 	 * (unless fallocate has been used to preallocate beyond EOF).
 	 */
+        /*
+         * 如果未启用CONFIG_THP_SWAP，大folio在交换时应被分割。
+         */
 	if (folio_test_large(folio)) {
 		index = shmem_fallocend(inode,
 			DIV_ROUND_UP(i_size_read(inode), PAGE_SIZE));
@@ -1490,10 +1495,13 @@ static int shmem_writepage(struct page *page, struct writeback_control *wbc)
 			split = true;
 	}
 
+        /* 如果需要分割大folio */
 	if (split) {
 try_split:
 		/* Ensure the subpages are still dirty */
+                /* 确保子页面仍然是脏的 */
 		folio_test_set_dirty(folio);
+                /* 尝试分割大页面 */
 		if (split_huge_page_to_list_to_order(page, wbc->list, 0))
 			goto redirty;
 		folio = page_folio(page);
@@ -1535,6 +1543,7 @@ try_split:
 		folio_mark_uptodate(folio);
 	}
 
+        /* 为folio分配交换条目 */
 	swap = folio_alloc_swap(folio);
 	if (!swap.val) {
 		if (nr_pages > 1)
@@ -1555,6 +1564,7 @@ try_split:
 	if (list_empty(&info->swaplist))
 		list_add(&info->swaplist, &shmem_swaplist);
 
+	/*  将页面加入swapcache，如果成功则尝试回写 */
 	if (add_to_swap_cache(folio, swap,
 			__GFP_HIGH | __GFP_NOMEMALLOC | __GFP_NOWARN,
 			NULL) == 0) {

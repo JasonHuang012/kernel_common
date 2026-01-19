@@ -44,6 +44,7 @@
 #define ZRAM_COMP_PRIORITY_MASK	0x3
 
 /* Flags for zram pages (table[page_no].flags) */
+/* zram页面状态, 重点 */
 enum zram_pageflags {
 	ZRAM_SAME = ZRAM_FLAG_SHIFT,	/* Page consists the same element */
 	ZRAM_WB,	/* page is stored on backing_device */

@@ -1733,7 +1733,11 @@ int swap_swapcount(struct swap_info_struct *si, swp_entry_t entry)
 	struct swap_cluster_info *ci;
 	int count;
 
+	/* 防止并发修改 */
 	ci = lock_cluster_or_swap_info(si, offset);
+	/*
+	 * 从swap_map中获取引用计数(引用计数增减的地方待研究)
+	 */
 	count = swap_count(si->swap_map[offset]);
 	unlock_cluster_or_swap_info(si, ci);
 	return count;
@@ -1821,6 +1825,7 @@ static bool folio_swapped(struct folio *folio)
 	if (!si)
 		return false;
 
+	/* swap_swapcount返回swap entry被进程PTE引用的数目 */
 	if (!IS_ENABLED(CONFIG_THP_SWAP) || likely(!folio_test_large(folio)))
 		return swap_swapcount(si, entry) != 0;
 
@@ -1831,8 +1836,10 @@ static bool folio_swapcache_freeable(struct folio *folio)
 {
 	VM_BUG_ON_FOLIO(!folio_test_locked(folio), folio);
 
+	/* 页面不是swapcache，返回false */
 	if (!folio_test_swapcache(folio))
 		return false;
+	/* 页面正在回写，放回false */
 	if (folio_test_writeback(folio))
 		return false;
 
@@ -1851,6 +1858,7 @@ static bool folio_swapcache_freeable(struct folio *folio)
 	 * Hibernation suspends storage while it is writing the image
 	 * to disk so check that here.
 	 */
+	/* 系统正在休眠，返回false */
 	if (pm_suspended_storage())
 		return false;
 
@@ -1866,10 +1874,29 @@ static bool folio_swapcache_freeable(struct folio *folio)
  *
  * Return: true if we were able to release the swap space.
  */
+/*
+ * 能真正删除swapcache的条件如下：
+ *	- 页面是swapcache，且页面没有正在回写，且系统没有正在休眠
+ *	- 或者 swap entry无效, 或者没有进程在使用这个swap entry
+ *
+ * 不移除swapcache的条件：
+ *	- 页面正在回写；
+ *	- 至少有一个进程的PTE在使用这个swap entry
+ */
 bool folio_free_swap(struct folio *folio)
 {
+	/*
+	 * !folio_swapcache_freeable成立的条件：
+	 *	- 页面不是swapcache
+	 *	- 页面正在回写
+	 *	- 系统正在休眠
+	 */
 	if (!folio_swapcache_freeable(folio))
 		return false;
+	/*
+	 * folio_swapped成立的条件
+	 *	- swap entry有效, 并且至少有一个进程在使用该swap entry
+	 */
 	if (folio_swapped(folio))
 		return false;
 

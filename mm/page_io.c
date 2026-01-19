@@ -243,6 +243,13 @@ int swap_writepage(struct page *page, struct writeback_control *wbc)
 	struct folio *folio = page_folio(page);
 	int ret;
 
+	/*
+	 * 尝试释放swapcache
+	 * 1.如果页面正在回写，则直接释放pagecache，也不需要在回写了
+	 * 2.没有进程的PTE在使用对应的swap entry，说明swap entry过时了，
+	 *   进程PTE直接指向物理内存页面了, 说明最近有进程在访问物理内存页面,
+	 *   则直接释放pagecache，也不需要回写了（因为是最近访问的）
+	 */
 	if (folio_free_swap(folio)) {
 		folio_unlock(folio);
 		return 0;

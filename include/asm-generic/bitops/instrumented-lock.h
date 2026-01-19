@@ -52,6 +52,7 @@ static inline void __clear_bit_unlock(long nr, volatile unsigned long *addr)
  * the returned value is 0.
  * It can be used to implement bit locks.
  */
+/* 置1，并返回原来的值 */
 static inline bool test_and_set_bit_lock(long nr, volatile unsigned long *addr)
 {
 	instrument_atomic_read_write(addr + BIT_WORD(nr), sizeof(long));

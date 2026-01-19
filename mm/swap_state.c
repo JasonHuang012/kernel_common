@@ -87,11 +87,19 @@ void *get_shadow_from_swap_cache(swp_entry_t entry)
  * add_to_swap_cache resembles filemap_add_folio on swapper_space,
  * but sets SwapCache flag and private instead of mapping and index.
  */
+/*
+ * 将folio加入到swapcache中，保存到xarray中;
+ * 设置PG_swapcache, 将entry保存到folio->swap
+ * 成功返回0
+ */
 int add_to_swap_cache(struct folio *folio, swp_entry_t entry,
 			gfp_t gfp, void **shadowp)
 {
+	/* 通过swap entry 获取对应的address_space */
 	struct address_space *address_space = swap_address_space(entry);
+	/* 通过swap entry获取swap offset */
 	pgoff_t idx = swap_cache_index(entry);
+	/* 初始化xarray */
 	XA_STATE_ORDER(xas, &address_space->i_pages, idx, folio_order(folio));
 	unsigned long i, nr = folio_nr_pages(folio);
 	void *old;
@@ -102,37 +110,56 @@ int add_to_swap_cache(struct folio *folio, swp_entry_t entry,
 	VM_BUG_ON_FOLIO(folio_test_swapcache(folio), folio);
 	VM_BUG_ON_FOLIO(!folio_test_swapbacked(folio), folio);
 
+	/* 增加引用计数 */
 	folio_ref_add(folio, nr);
+	/* 设置PG_swapcache */
 	folio_set_swapcache(folio);
+	/* 保存swap entry */
 	folio->swap = entry;
 
+	/* 将folio插入xarray */
 	do {
+		/* 锁定xarray，同时关闭中断 */
 		xas_lock_irq(&xas);
+		/* 确保索引范围是存在的 */
 		xas_create_range(&xas);
 		if (xas_error(&xas))
 			goto unlock;
+		/* 对于复合页面，需要逐个处理 */
 		for (i = 0; i < nr; i++) {
 			VM_BUG_ON_FOLIO(xas.xa_index != idx + i, folio);
+			/* 处于shadow，用于workingset检测 */
 			if (shadowp) {
 				old = xas_load(&xas);
 				if (xa_is_value(old))
 					*shadowp = old;
 			}
+			/*
+			 * 将folio存储到xarray， 建立entry--> folio的映射，具体细节待研究
+			 * 键:	entry
+			 * 值：	folio
+			 */
 			xas_store(&xas, folio);
-			xas_next(&xas);
+			xas_next(&xas);			// 移动到下一个索引
 		}
+		/* 更新统计信息 */
 		address_space->nrpages += nr;
 		__node_stat_mod_folio(folio, NR_FILE_PAGES, nr);
 		__lruvec_stat_mod_folio(folio, NR_SWAPCACHE, nr);
 unlock:
 		xas_unlock_irq(&xas);
-	} while (xas_nomem(&xas, gfp));
+	} while (xas_nomem(&xas, gfp));	// 如果内存不足且申请不到内存，则退出
 
+	/* 加入xarray成功，则直接返回0 */
 	if (!xas_error(&xas))
 		return 0;
 
+	/* 加入swapcache失败的清理操作 */
+	/* 清除PG_swapcache */
 	folio_clear_swapcache(folio);
+	/* 减少引用计数 */
 	folio_ref_sub(folio, nr);
+	/* 返回错误码 */
 	return xas_error(&xas);
 }
 
@@ -185,6 +212,7 @@ bool add_to_swap(struct folio *folio)
 	VM_BUG_ON_FOLIO(!folio_test_locked(folio), folio);
 	VM_BUG_ON_FOLIO(!folio_test_uptodate(folio), folio);
 
+	/* 分配空闲slot，返回对应的swap entry */
 	entry = folio_alloc_swap(folio);
 	if (!entry.val)
 		return false;
@@ -353,6 +381,7 @@ struct folio *swap_cache_get_folio(swp_entry_t entry,
 {
 	struct folio *folio;
 
+	/* 利用swap entry得到的swap address_space和offset，获取folio */
 	folio = filemap_get_folio(swap_address_space(entry), swap_cache_index(entry));
 	if (!IS_ERR(folio)) {
 		bool vma_ra = swap_use_vma_readahead();
@@ -707,6 +736,12 @@ skip:
 	return folio;
 }
 
+/*
+ * 初始化swap空间对应的address_space，一个address_space对应一个64M的swap空间对应的
+ *
+ * swapper_spaces是一个全局数组，一个成员对应一个swap分区
+ * swapper_spaces数组的成员是一个address_space数组，长度为 swap分区大小/64M
+ */
 int init_swap_address_space(unsigned int type, unsigned long nr_pages)
 {
 	struct address_space *spaces, *space;

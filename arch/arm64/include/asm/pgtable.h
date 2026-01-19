@@ -1415,12 +1415,12 @@ static inline pmd_t pmdp_establish(struct vm_area_struct *vma,
 
 /*
  * Encode and decode a swap entry:
- *	bits 0-1:	present (must be zero)
+ *	bits 0-1:	present (must be zero)	// 置0，表示为swap entry
  *	bits 2:		remember PG_anon_exclusive
  *	bit  3:		remember uffd-wp state
- *	bits 6-10:	swap type
+ *	bits 6-10:	swap type		// swap_info[]数组的索引，用于查找对应的swap area
  *	bit  11:	PTE_PRESENT_INVALID (must be zero)
- *	bits 12-61:	swap offset
+ *	bits 12-61:	swap offset		// swap area/swap分区内的索引，用于查找对应slot
  */
 #define __SWP_TYPE_SHIFT	6
 #define __SWP_TYPE_BITS		5

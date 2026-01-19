@@ -786,7 +786,7 @@ static pageout_t pageout(struct folio *folio, struct address_space *mapping,
 
 		/* 设置PG_reclaim回收标志 */
 		folio_set_reclaim(folio);
-		/* 调用具体的writeback接口, 待办：zram的writeback流程及接口 */
+		/* 调用具体的writeback接口, 待办：zram的shmem_writepage */
 		res = mapping->a_ops->writepage(&folio->page, &wbc);
 		if (res < 0)
 			handle_write_error(mapping, folio, res);
@@ -824,11 +824,19 @@ static int __remove_mapping(struct address_space *mapping, struct folio *folio,
 	int refcount;
 	void *shadow = NULL;
 
+	/* 确保folio已经锁定，并且mapping正确 */
 	BUG_ON(!folio_test_locked(folio));
 	BUG_ON(mapping != folio_mapping(folio));
 
+        /*
+         * 锁获取策略：
+         * - 交换缓存folio不需要i_lock，因为交换缓存有自己的锁机制
+         * - 普通文件缓存folio需要获取inode的i_lock来保护并发访问
+         */
 	if (!folio_test_swapcache(folio))
 		spin_lock(&mapping->host->i_lock);
+
+        /* 获取mapping的页缓存锁并禁用中断，防止并发修改radix树 */
 	xa_lock_irq(&mapping->i_pages);
 	/*
 	 * The non racy check for a busy folio.
@@ -855,30 +863,65 @@ static int __remove_mapping(struct address_space *mapping, struct folio *folio,
 	 * Note that if the dirty flag is always set via folio_mark_dirty,
 	 * and thus under the i_pages lock, then this ordering is not required.
 	 */
+	/*
+         * 繁忙folio的非竞争检查 - 这是关键的安全检查！
+         *
+         * 必须注意测试顺序。当有人持有folio引用时，可能会先弄脏folio然后丢弃引用。
+         * 如果在这里先测试脏标志再测试引用计数，可能会发生以下竞争：
+	 *
+	 *
+         * 反转测试顺序可确保这种情况不会被忽视。
+         * smp_rmb由folio_ref_freeze中的atomic_cmpxchg提供内存屏障。
+         *
+         * 注意：如果脏标志总是通过folio_mark_dirty设置（在i_pages锁下），
+         * 则不需要此顺序。
+         */
+
+        /* 计算期望的引用计数：1（页缓存引用）+ 页数 */
 	refcount = 1 + folio_nr_pages(folio);
+        /*
+         * 冻结引用计数：如果当前引用计数等于期望值，将其设置为0
+         * 这是一个原子操作，提供所需的内存屏障
+	 *
+	 * 如果引用计数不匹配，则有其它引用这，不能free
+         */
 	if (!folio_ref_freeze(folio, refcount))
 		goto cannot_free;
+
 	/* note: atomic_cmpxchg in folio_ref_freeze provides the smp_rmb */
+        /* 如果folio是脏的，不能安全移除，解冻引用计数 */
 	if (unlikely(folio_test_dirty(folio))) {
 		folio_ref_unfreeze(folio, refcount);
 		goto cannot_free;
 	}
 
+	/* 根据不同的文件类型处理 */
 	if (folio_test_swapcache(folio)) {
+		/* 处理交换缓存页面, 需要从交换缓存中移除并释放交换槽 */
 		swp_entry_t swap = folio->swap;
 
 		/*
-		 * 研究一下workingset-refault机制
+		 * 如果是回收 操作，并且地址空间没有退出（后续可能还会访问？）
+		 * 则创建workingset shadow，用于后续检测refault和thrashing(颠簸)
 		 */
 		if (reclaimed && !mapping_exiting(mapping))
 			shadow = workingset_eviction(folio, target_memcg);
+                /*
+		 * 从交换缓存的xarray中移除folio，并保存shadow
+		 * (4.2内核版本之前还是用radix树, xarray是基于radix实现的)
+		 */
 		__delete_from_swap_cache(folio, swap, shadow);
+                /* 更新内存控制组的交换统计信息 */
 		mem_cgroup_swapout(folio, swap);
+                /* 释放页缓存锁 */
 		xa_unlock_irq(&mapping->i_pages);
+                /* 释放交换槽slot的引用，如果这是最后一个引用则会真正释放交换槽 */
 		put_swap_folio(folio, swap);
 	} else {
+		/* 处理普通文件缓存页面 */
 		void (*free_folio)(struct folio *);
 
+                /* 获取地址空间操作中定义的页面释放函数 */
 		free_folio = mapping->a_ops->free_folio;
 		/*
 		 * Remember a shadow entry for reclaimed file cache in
@@ -896,19 +939,32 @@ static int __remove_mapping(struct address_space *mapping, struct folio *folio,
 		 * exceptional entries and shadow exceptional entries in the
 		 * same address_space.
 		 */
+		 /*
+                 * 为回收的文件缓存创建影子条目以检测refault（系统抖动）
+                 *
+                 * 但以下情况除外：
+                 * 1. 地址空间正在退出（inode回收需要清空radix树）
+                 * 2. DAX映射（不想混合DAX异常条目和影子异常条目）
+                 * 3. 非文件LRU folio（如匿名内存）
+                 */
+
 		if (reclaimed && folio_is_file_lru(folio) &&
 		    !mapping_exiting(mapping) && !dax_mapping(mapping))
 			shadow = workingset_eviction(folio, target_memcg);
+                /* 从文件缓存中移除folio */
 		__filemap_remove_folio(folio, shadow);
 		xa_unlock_irq(&mapping->i_pages);
+                /* 如果映射可收缩，将inode添加到LRU列表以便后续回收 */
 		if (mapping_shrinkable(mapping))
 			inode_add_lru(mapping->host);
 		spin_unlock(&mapping->host->i_lock);
 
+                /* 如果定义了释放函数，调用它来释放folio */
 		if (free_folio)
 			free_folio(folio);
 	}
 
+        /* 成功移除folio，返回1 */
 	return 1;
 
 cannot_free:
@@ -1649,7 +1705,7 @@ retry:
 		 */
 		/*
 		 * PG_swapbacked表示该页面可以被swap到交换分区
-		 * PG_swapcache表示该页面已经被swap到交换分区
+		 * PG_swapcache表示该页面已经被加入swapcache
 		 * 这两个标志都用在匿名页和shmem
 		 * PG_swapbacked在内存回收的作用是防止数据丢失，也就是回收页面之前要swap
 		 *

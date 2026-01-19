@@ -26,7 +26,7 @@
  * the head of the inactive list and page reclaim scans pages from the
  * tail.  Pages that are accessed multiple times on the inactive list
  * are promoted to the active list, to protect them from reclaim,
- * whereas active pages are demoted to the inactive list when the
+ * whereas(然而) active pages are demoted to the inactive list when the
  * active list grows too big.
  *
  *   fault ------------------------+
@@ -176,7 +176,7 @@
  * identify the node) is stored in the now empty page cache
  * slot of the evicted page.  This is called a shadow entry.
  *
- * On cache misses for which there are shadow entries, an eligible
+ * On cache misses for which there are shadow entries, an eligible(合格的)
  * refault distance will immediately activate the refaulting page.
  */
 
@@ -196,6 +196,26 @@
  */
 static unsigned int bucket_order __read_mostly;
 
+/**
+ * pack_shadow - 将信息打包到影子条目中
+ * @memcgid: 内存控制组ID
+ * @pgdat: NUMA节点
+ * @eviction: 驱逐时代号
+ * @workingset: 是否属于工作集
+ *
+ * 返回值: 打包好的XA值，可以作为影子条目存储在radix树中
+ *
+ * 打包格式（从低位到高位）：
+ * [0:0]    - workingset标志（1位）
+ * [1:WORKINGSET_SHIFT-1] - NUMA节点ID
+ * [WORKINGSET_SHIFT:WORKINGSET_SHIFT+NODES_SHIFT-1] - 内存控制组ID
+ * [剩余高位] - 驱逐时代号
+ *
+ * 当page驱逐(reclaim)操作时，将nonresident_age快照信息存储在被驱逐的为空的页面缓存槽中，
+ * 这种方式被称作shadow entry。通过shadow entry获取page refault distance 决定page的流转方向是active or inactive list
+ *
+ * 将page的Node节点、Memcg、PageWorkingset等信息组合并存储在XArray节点当中，便于后续page shadow entry的检测。
+ */
 static void *pack_shadow(int memcgid, pg_data_t *pgdat, unsigned long eviction,
 			 bool workingset)
 {
@@ -207,6 +227,10 @@ static void *pack_shadow(int memcgid, pg_data_t *pgdat, unsigned long eviction,
 	return xa_mk_value(eviction);
 }
 
+/*
+ * 解析shadow entry 获取page所属的Node、Memcg、PageWorkingset、eviction等信息，
+ * 用于page workingset_refault的判断。
+ */
 static void unpack_shadow(void *shadow, int *memcgidp, pg_data_t **pgdat,
 			  unsigned long *evictionp, bool *workingsetp)
 {
@@ -353,12 +377,19 @@ static void lru_gen_refault(struct folio *folio, void *shadow)
  * to the in-memory dimensions. This function allows reclaim and LRU
  * operations to drive the non-resident aging along in parallel.
  */
+/*
+ * 当内存中的页老化时，非驻留页也需要相应老化，以便后续的refault距离
+ * 与内存中的维度具有可比性。这个函数允许回收和LRU操作并行驱动非驻留老化。
+ *
+ * 维护一个全局的"非驻留年龄"计数器nonresident_age，每次页被驱逐时递增。
+ * 这个计数器作为时间戳，用于计算页被驱逐后经过了多少"内存活动"。
+ */
 void workingset_age_nonresident(struct lruvec *lruvec, unsigned long nr_pages)
 {
 	/*
 	 * Reclaiming a cgroup means reclaiming all its children in a
-	 * round-robin fashion. That means that each cgroup has an LRU
-	 * order that is composed of the LRU orders of its child
+	 * round-robin fashion(轮询的方式). That means that each cgroup has an LRU
+	 * order that is composed(组成) of the LRU orders of its child
 	 * cgroups; and every page has an LRU position not just in the
 	 * cgroup that owns it, but in all of that group's ancestors.
 	 *
@@ -366,6 +397,7 @@ void workingset_age_nonresident(struct lruvec *lruvec, unsigned long nr_pages)
 	 * the virtual inactive lists of all its parents, including
 	 * the root cgroup's, age as well.
 	 */
+	/* 向上遍历所有父lruvec，更新其对应的nonresident_age，原子操作避免并发 */
 	do {
 		atomic_long_add(nr_pages, &lruvec->nonresident_age);
 	} while ((lruvec = parent_lruvec(lruvec)));
@@ -378,6 +410,22 @@ void workingset_age_nonresident(struct lruvec *lruvec, unsigned long nr_pages)
  *
  * Return: a shadow entry to be stored in @folio->mapping->i_pages in place
  * of the evicted @folio so that a later refault can be detected.
+ */
+/*
+ * 记录页面被驱逐（回收）的事件
+ * 通过影子条目记录页被驱逐时的age信息，用于后续refault时计算refault distance（重新访问距离），
+ * 识别系统是否出现抖动。
+ *
+ * 1.读取当前的nonresident_age，并做右移运算；
+ * 2.更新nonresident_age, 增加被驱逐页的数量；
+ * 3.将特定信息打包到shadow中，包括
+ *	- memcgid: 哪个cgroup的页被驱逐
+ *	- pgdat: 在哪个NUMA节点
+ *	- eviction: 驱逐时的时代号
+ *	- workingset: 该页是否属于工作集（访问频率高）
+ *
+ * __remove_mapping
+	-> workingset_eviction
  */
 void *workingset_eviction(struct folio *folio, struct mem_cgroup *target_memcg)
 {
@@ -397,9 +445,28 @@ void *workingset_eviction(struct folio *folio, struct mem_cgroup *target_memcg)
 	lruvec = mem_cgroup_lruvec(target_memcg, pgdat);
 	/* XXX: target_memcg can be NULL, go through lruvec */
 	memcgid = mem_cgroup_id(lruvec_memcg(lruvec));
+	/* 读取nonresident_age
+         * 这个计数器随着时间推移而递增，代表了"内存时代"
+	 */
 	eviction = atomic_long_read(&lruvec->nonresident_age);
+        /*
+         * 将时代号右移bucket_order位，相当于除以2^bucket_order
+         * 这创建了时间桶，减少精度以节省空间，同时保持足够的时序信息
+         */
 	eviction >>= bucket_order;
+        /*
+         * 更新nonresident_age：增加被驱逐页的数量
+         * 这相当于推进"内存时钟"，所有父cgroup都会更新
+         */
 	workingset_age_nonresident(lruvec, folio_nr_pages(folio));
+
+	/*
+         * 打包所有信息到shadow中，包括：
+         *	- memcgid: 哪个cgroup的页被驱逐
+         *	- pgdat: 在哪个NUMA节点
+         *	- eviction: 驱逐时的时代号
+         *	- workingset: 该页是否属于工作集（访问频率高）
+         */
 	return pack_shadow(memcgid, pgdat, eviction,
 				folio_test_workingset(folio));
 }
@@ -416,17 +483,62 @@ void *workingset_eviction(struct folio *folio, struct mem_cgroup *target_memcg)
  *
  * Return: true if the shadow is for a recently evicted folio; false otherwise.
  */
+
+/*
+ * 以下来自：https://zhuanlan.zhihu.com/p/10798919273
+ *
+ * - 当read产生一个新的page，将page放入到inactive list head头部，inactive list原有的page从head向tail尾部
+ *   迁移一个位置，将原有的inactive list tail尾部的page(不是read产生的新page)驱逐出inactive list(reclaim or promoted)。
+ * - 当page在inactive list第二次被访问时，将page从inactive list promoted提升到active list，对应的原有在
+ *   inactive list的page从原有位置向tail尾部迁移若干位置。
+ *
+ * - 当一个page从inactive head到inactive tail被驱逐时，被访问过的page数至少等于inactive list的长度
+ *   (就是inactive head到tail的长度即从头到尾检查的pages数)。
+ * - 此外，在 page eviction驱逐时，假设测量 inactive list上的 page 被evictions驱逐与promoted提升的总和(E)，
+ *   期间通过page fault重新读取的数据(R)，将E、R数据对比最小的差值即page的最小重新访问距离，该距离被称为refault distance
+ *
+ * page第一次访问为fault(page 存放在inactive list)，第二次被访问则是refault，
+ * 因此结合内部长度与外部长度则可以得出page被访问最小的长度。
+ *
+ * NR_inactive + (R - E)
+ * NR_inactive + (R - E)与total memory的对比即可简单的描述page是thrashing颠簸：
+ *
+ * NR_inactive + (R - E) < total memory, 则page thrashing，从系统的角度考虑希望保存更多的cache缓存，
+ * 说明系统当中有足够的内存空间保留这些被频繁访问的页面，此时如果访问频繁的页面被频繁的换入换出显然是不合理的所以判定thrashing；
+ *
+ * NR_inactive + (R - E) > total memory, 则page not thrashing,说明当前系统内存不足，面对这种状态系统是无能为力的，
+ * 为了保证系统的运行页面被频繁的换入换出是不可避免的，这种情况下page的流转不应该被判定为thrashing颠簸(换个角度：
+ * 页面被重读的distance超过了系统total memory的长度,则认为是page的正常流转过程，不应该被判定为thrashing)；
+ *
+ * 通过page的访问最小距离大于inactive list且是否小于内存总和时可以判定page是否thrashing，
+ * 如果大于内存总和则判定非颠簸(not thrashing)、如果小于内存总和则判定为颠簸(thrashing) 。
+ *
+ * NR_inactive + (R - E) <= NR_inactive + NR_active 即 (R - E) <= NR_active
+ *
+ * 在系统当中内存分为file-backed page、anon page根据用途的不同将page划分为文件页、匿名页。所以在计算中也要考虑其他页面内存总和数量。
+ *
+ * NR_inactive_file + (R - E) <= NR_inactive_file + NR_active_file + NR_inative_anon + NR_active_anon
+ * NR_inactive_anon + (R - E) <= NR_inactive_file + NR_active_file + NR_inative_anon + NR_active_anon
+ *
+ * 进一步简化：(对应下面的代码)
+ * file
+ *	(R - E) <= NR_active_file + NR_inative_anon + NR_active_anon
+ * anon
+ *	(R - E) <= NR_inactive_file + NR_active_file + NR_active_anon
+ *
+ */
 bool workingset_test_recent(void *shadow, bool file, bool *workingset,
 				bool flush)
 {
-	struct mem_cgroup *eviction_memcg;
-	struct lruvec *eviction_lruvec;
-	unsigned long refault_distance;
-	unsigned long workingset_size;
-	unsigned long refault;
-	int memcgid;
-	struct pglist_data *pgdat;
-	unsigned long eviction;
+
+        struct mem_cgroup *eviction_memcg;  // 驱逐发生时所属的内存控制组
+        struct lruvec *eviction_lruvec;     // 驱逐发生时所属的LRU向量
+        unsigned long refault_distance;     // 重新访问距离，关键指标
+        unsigned long workingset_size;      // 工作集大小，作为比较基准
+        unsigned long refault;              // 当前的非驻留年龄（时间戳）
+        int memcgid;                        // 内存控制组ID
+        struct pglist_data *pgdat;          // NUMA节点
+        unsigned long eviction;             // 驱逐时的非驻留年龄（时间戳）
 
 	rcu_read_lock();
 
@@ -439,7 +551,9 @@ bool workingset_test_recent(void *shadow, bool file, bool *workingset,
 	}
 
 
+	/* 解压showdow，获取页面被驱逐时保存的nonresident_age, 称之为页面驱逐时间戳，其实就是页面驱逐页数 */
 	unpack_shadow(shadow, &memcgid, &pgdat, &eviction, workingset);
+        /* 将页面驱逐时间戳左移恢复原始精度（之前存储时右移了bucket_order位） */
 	eviction <<= bucket_order;
 
 	/*
@@ -480,7 +594,9 @@ bool workingset_test_recent(void *shadow, bool file, bool *workingset,
 	if (flush)
 		mem_cgroup_flush_stats_ratelimited(eviction_memcg);
 
+	/* 获取页面驱逐时对应的lruvec */
 	eviction_lruvec = mem_cgroup_lruvec(eviction_memcg, pgdat);
+	/* 获取当前内存节点的页面驱逐时间戳 */
 	refault = atomic_long_read(&eviction_lruvec->nonresident_age);
 
 	/*
@@ -499,6 +615,7 @@ bool workingset_test_recent(void *shadow, bool file, bool *workingset,
 	 * longest time, so the occasional inappropriate activation
 	 * leading to pressure on the active list is not a problem.
 	 */
+	/* 计算refault_distance，当前的页面驱逐时间戳 - 之前的页面驱逐时间戳 */
 	refault_distance = (refault - eviction) & EVICTION_MASK;
 
 	/*
@@ -507,6 +624,13 @@ bool workingset_test_recent(void *shadow, bool file, bool *workingset,
 	 * all the memory was available to the workingset. Whether
 	 * workingset competition needs to consider anon or not depends
 	 * on having free swap space.
+	 */
+	/*
+	 * workingset_size计算
+	 * 对于文件页
+	 *	working_size = NR_active_file + NR_ative_anon + NR_inactive_anon
+	 * 对于匿名页
+	 *	working_size = NR_active_file + NR_inactive_file + NR_active_anon
 	 */
 	workingset_size = lruvec_page_state(eviction_lruvec, NR_ACTIVE_FILE);
 	if (!file) {
@@ -523,17 +647,41 @@ bool workingset_test_recent(void *shadow, bool file, bool *workingset,
 	}
 
 	mem_cgroup_put(eviction_memcg);
+	/*
+	 * 如果refault_distance小于或等于workingset_size，则表示是最近的重新访问,
+	 * 需要重新激活该页面，否则会发生memory thrashing
+	 */
 	return refault_distance <= workingset_size;
 }
 
 /**
- * workingset_refault - Evaluate the refault of a previously evicted folio.
+ * workingset_refault - Evaluate(评估) the refault of a previously evicted folio.
  * @folio: The freshly allocated replacement folio.
  * @shadow: Shadow entry of the evicted folio.
  *
  * Calculates and evaluates the refault distance of the previously
  * evicted folio in the context of the node and the memcg whose memory
  * pressure caused the eviction.
+ */
+/*
+ * 评估之前被驱逐的页面的refault
+ * folio: 新分配的页面
+ * shadow: 之前被驱逐的页面, 被驱逐时对应的shadow
+ *
+ * 通过对比refault_distance和workingset_size来判断需不需要激活页面
+ * 主要是在workingset_test_recent判断的
+ *
+ * do_page_fault
+ *     -> handle_mm_fault
+ *         -> __handle_mm_fault
+ *		-> handle_pte_fault
+ *		    -> do_swap_page
+ *			-> workingset_refault
+ * filemap_add_folio
+ *	-> workingset_refault
+
+ * workingset_eviction、workingset_activation 在于描述page从inactive list驱逐、升迁的过程，
+ * 而workingset_refault则是发生在page fault申请page时，将页面添加到inactive or active list的过程。
  */
 void workingset_refault(struct folio *folio, void *shadow)
 {
@@ -544,6 +692,7 @@ void workingset_refault(struct folio *folio, void *shadow)
 	bool workingset;
 	long nr;
 
+	/* MGLRU，有自己的refault评估 */
 	if (lru_gen_enabled()) {
 		lru_gen_refault(folio, shadow);
 		return;
@@ -562,25 +711,38 @@ void workingset_refault(struct folio *folio, void *shadow)
 	nr = folio_nr_pages(folio);
 	memcg = folio_memcg(folio);
 	pgdat = folio_pgdat(folio);
-	lruvec = mem_cgroup_lruvec(memcg, pgdat);
+	lruvec = mem_cgroup_lruvec(memcg, pgdat);	// 获取新分配页面对应的lruvec
 
+	/* 记录workingset refault事件，/proc/vmstat: workingset_refault_anon/workingset_refault_file */
 	mod_lruvec_state(lruvec, WORKINGSET_REFAULT_BASE + file, nr);
 
+	/*
+	 * 检测是否是最近重新访问，如果是返回true，继续往下走
+	 *
+	 * 如果refault_distance小于或等于workingset_size，则表示是最近的重新访问,
+	 * 需要重新激活该页面，否则会发生memory thrashing
+	 */
 	if (!workingset_test_recent(shadow, file, &workingset, true))
 		return;
 
+	/* 设置PG_active */
 	folio_set_active(folio);
+	/* 更新nonresident_age */
 	workingset_age_nonresident(lruvec, nr);
+	/* 记录workingset激活事件, /proc/vmstat: workingset_activate_anon/workingset_activate_file */
 	mod_lruvec_state(lruvec, WORKINGSET_ACTIVATE_BASE + file, nr);
 
 	/* Folio was active prior to eviction */
+        /* 如果folio在驱逐前是活跃的（属于工作集） */
 	if (workingset) {
+                /* 标记folio属于工作集 */
 		folio_set_workingset(folio);
 		/*
 		 * XXX: Move to folio_add_lru() when it supports new vs
 		 * putback
 		 */
 		lru_note_cost_refault(folio);
+                /* 记录工作集恢复事件，/proc/vmstat: workingset_restore_anon/workingset_restore_file */
 		mod_lruvec_state(lruvec, WORKINGSET_RESTORE_BASE + file, nr);
 	}
 }
@@ -588,6 +750,12 @@ void workingset_refault(struct folio *folio, void *shadow)
 /**
  * workingset_activation - note a page activation
  * @folio: Folio that is being activated.
+ */
+/*
+ * 记录页面提升到active list（被激活）的事件
+ *
+ * folio_mark_accessed
+ *	->workingset_activation
  */
 void workingset_activation(struct folio *folio)
 {

@@ -35,3 +35,239 @@ https://www.cnblogs.com/ronnydm/p/5547972.html
 
 https://zhuanlan.zhihu.com/p/70964195
 https://blog.csdn.net/weixin_42730667/article/details/123363494
+
+
+# kasan检测原理
+
+http://www.wowotech.net/memory_management/424.html
+
+## 检测原理
+
+KASAN的原理是利用额外的内存标记可用内存的状态。这部分额外的内存被称作shadow memory（影子区）。KASAN将1/8的内存用作shadow memory。使用特殊的magic num填充shadow memory，在每一次load/store（load/store检查指令由编译器插入）内存的时候检测对应的shadow memory确定操作是否valid。连续8 bytes内存（8 bytes align）使用1 byte shadow memory标记。如果8 bytes内存都可以访问，则shadow memory的值为0；如果连续N(1 =< N <= 7) bytes可以访问，则shadow memory的值为N；如果8 bytes内存访问都是invalid，则shadow memory的值为负数。
+
+1 byte shadow memroy	8 byte memory
+0			[1][1][1][1][1][1][1][1]	// 8byte内存都可以访问
+5			[1][1][1][1][1][][][]		// 前5byte内存可以访问
+<0			[][][][][][][][]		// 8byte内存都不可以访问
+
+## 如何判断非法访问
+addr是基地址，如果要访问addr+1，访问长度为2，即N为2
+
+(1)如果前两个byte可以访问：shadow value = 2
+[1][1][][][][][][]
+
+if (*shadow && *shadow < ((unsigned long)addr & 7) + N)
+	report_bug();
+
+if (2 && 2 < (1 + 2)	//非法访问
+	report_bug();
+
+(2)如果前三个byte可以访问：shadow value = 3
+[1][1][1][][][][][]
+
+if (3 && 3 < (1 + 2)	//合法访问
+	report_bug();
+
+*shadow < ((unsigned long)addr & 7) + N
+可以理解为：可访问的最后位置 < 要访问的最后位置，那就是越界了
+
+## 为什么8个byte的内存，需要用1byte shadow memory，不能只用一半吗，4个bit?
+
+为什么shadow memroy要用1byte来标记对应的原本内存的8字节，3bit就可以表示8字节前多少个字节被使用，考虑到方便对齐等问题，4bit就可以实现对应的操作。就是1/2byte的shadow memory对应原本内存的8byte。不是更节省内存吗？
+
+1. 1byte可以存放更多调试内存，不仅仅是表示内存是否可以访问
+
+2. 特殊状态编码需求
+KASAN 需要表示多种内存状态，不仅仅是"前N字节有效"：
+Shadow Value	含义
+0x00	全部 8 bytes 可访问
+0x01-0x07	前 1-7 bytes 可访问
+0xF1-0xF9	已释放内存 (不同的释放堆栈)
+0xFA	redzone (内存周围的保护区域)
+0xFB	内核redzone
+0xFC	已释放的大内存块
+0xFD	堆栈左保护区域
+0xFE	堆栈右保护区域
+0xFF	隔离/不可访问内存
+
+2.效率问题
+````
+c
+// 使用 1 byte 的 shadow 可以高效访问
+u8 *shadow = (u8*)shadow_addr;
+u8 shadow_val = *shadow;  // 单字节加载，对齐访问
+
+// 如果使用 4 bits：
+// 需要处理半字节访问，代码复杂且低效
+u8 *shadow_byte = (u8*)shadow_addr;
+u8 shadow_val;
+if (addr & 1) {
+    shadow_val = (*shadow_byte >> 4) & 0x0F;  // 高4位
+} else {
+    shadow_val = *shadow_byte & 0x0F;         // 低4位
+}
+```
+
+# pahole
+
+可以查看可执行程序的结构体的空间布局，查看是否有内存空洞，可以由于优化结构体大小。
+
+# cache
+## cache inclusive 和 cache exclusive
+
+原文链接：https://blog.csdn.net/luolaihua2018/article/details/132641238
+
+假设系统中有两级cache：L2 cache 和 L1 cache，
+- Inclusive cache: L2包含了所有的L1里的所有有效数据。
+- Exclusive cache: L1 和L2 的数据互斥，同样的一份数据不能同时存在于L1和L2。
+
+### inclusive cache介绍
+
+假设系统中有两级cache，并且L2 和 L1 是inclusive关系。当CPU对一个地址进行读写时，cache controler会遵守如下规则：
+
+- 如果在 L1 cache中hit，则直接将 L1 cache中的数据读取并返回给CPU。
+- 如果在 L1 cache中miss，但在 L2 cache hit，则把 L2 cache中的数据读取并返回给CPU，同时会把该数据对应的cache line填充到L1 cache中。
+- 如果规则2中的linefill 操作导致L1中发生cache line eviction，该eviction并不会影响到L2，因为被evict的cache line肯定在L2中有备份。
+- 如果在 L1 或 L2 中均miss，则从主存中取出对应cache line 数据并对L1和 L2 都进行linefill。
+- 如果L2 发生eviction，L2 cache会向 L1 cache发送invalidation请求，使L1中对应的cache line失效，以达到L1 和 L2的数据同步。
+
+示例：
+(a) 假设 L1 和 L2 cache的初始状态为空。
+(b) CPU发送一个读 X 请求，在L1 和 L2 都会发生read miss，因此对应cache line从主存被linefill到 L1 和 L2。
+(c ) CPU又发出读 Y 请求，L1 和 L2 也将read miss ，cache line Y 也被linefill到 L1 和 L2 中。
+(d) 如果cache line X 必须从 L1 中被驱逐（evict），那么它只会从 L1 中移除，不会影响到L2。
+(e) 如果cache line Y 必须从 L2 中被驱逐（evict），为了保证inclusive policy，它会向 L1 发送invalidation request， L1 会使cache line Y 失效。
+
+### exclusive cache介绍
+
+假设系统中有两级cache，并且L2 和 L1 是exclusive关系。当CPU对一个地址进行读写时，cache controler会遵守如下规则：
+
+- 如果在 L1 cache中hit，则直接将 L1 cache中的数据读取并返回给CPU。
+- 如果在 L1 cache中miss，但在 L2 cache hit，则把 L2 cache中的数据读取并返回给CPU，同时会把该数据对应的cache line **移动（move）或者说是交换（exchang）**到L1 cache中，可以理解为把 L2的对应cache line移除，填充到L1 中，以保证exclusive。
+- 如果规则2中的linefill 操作导致L1中发生cache line eviction，这个被驱逐的cache line会被填充到L2中，这是L2 发生linefill的唯一方式，所以也称 这样的L2 cache 为 victim cache，专门接收 L1 的victim cache line的cache。
+- 如果在 L1 或 L2 中均miss，则从主存中取出对应cache line 数据并只对L1进行linefill，而不是L2。
+
+示例：
+(a) 假设 L1 和 L2 cache的初始状态为空。
+(b) CPU发送一个读 X 请求，在L1 和 L2 都会发生read miss，但是对应cache line只会从主存被linefill到 L1 。
+(c ) CPU又发出读 Y 请求，L1 和 L2 也将read miss ，cache line Y 也被linefill到 L1 。
+(d) 如果cache line X 必须从 L1 中被驱逐（evict），那么它会从 L1 中被evict 到L2。
+
+### inclusive cache 和 exclusive cache的比较
+
+事实上， inclusive cache 和 exclusive cache不存在绝对的性能优劣之分。在具体的约束条件下，系统架构是选择inclusive 还是exclusive ，一定是需要在各种考量因素之间做一个权衡。
+研究表明，或者说是经验值（a general rule-of-thumb）：当L2 cache size 比 L1 cache size大于8 倍及以上时， inclusive 性能更好，反之，exclusive更好。
+
+下面我们将从coherency、miss rate以及capacity的角度来简单分析二者性能上的差异。以下分析基于两层cache，且有多个私有L1以及共享一个L2的情况。
+
+#### cache coherency
+从维护数据一致性的角度，显然是inclusive cache更简单。因为L1里的数据是L2的一个子集，二者保存着一部分相同的数据。而在exclusive cache下，L1和L2里的内容是互斥的，在有多个私有L1以及共享一个L2的情况下，inclusive cache的coherency维护难度更低。
+
+#### miss rate
+我们考虑以下场景：
+对于inclusive cache：L1发生了linefill，将cache line A填充到L1，同时也填充到L2。如果cache line A的填充导致了L2中cache line B被驱逐，而cache line B恰好在另一个L1中，且经常被使用，由于要保证inclusive，另一个L1也不得不将cache line B给invalidate。这就提高了L1的miss rate。
+对于inclusive cache：如果L1 miss， L2 hit，则需要把L2 hit的line和L1中的一条line 交换。而inclusive cache面对这种情况，只需要直接从L2 拷贝 hit cache line到L1中。交换操作要比拷贝操作复杂，所以此时inclusive cache的总线负载和miss penalty更低。
+在某个L1中发生miss，cache controler想看看所需的cache line是否存在于其他私有L1中。如果是inclusive cache，就无需遍历其他L1，只需在共享的L2中查找即可。这意味着inclusive cache的miss 延迟更短。
+
+#### cache capacity
+对于exclusive cache，cache的容量是层次结构中所有cache的总容量。而inclusive cache的内存容量由L2 cache决定的，如果L2 cache较小，则在inclusive cache中浪费的cache容量更多。
+对于inclusive ，越大的cache可以使用越大的cache line，这可能减小二级cache tags的大小。而Exclusive需要L1和L3的cache line大小相同，以便进行替换。如果二级cahce是远远大于一级cache，并且cache data部分远远大于tag，省下的tag部分可以存放数据。
+exclusive方式可以存储更多数据，cache的空间利用率更高。
+
+## cache映射方式
+参考： https://zhuanlan.zhihu.com/p/102293437
+
+cache的寻址方式 [tag | index | offset]
+
+tag
+tag用来判断访问地址对应的cacheline是否已经位于cache中，一个tag对应一个cache line，比如cpu访问一个地址，这个地址的tag
+tag也是cache的一部分，是cache里面的一小块内存，不包含在cache size里面
+
+index
+用来寻址cacheline
+
+offset
+用来寻址cacheline中的具体某个字节
+
+- 直接映射(Direct mapped)	-适合大容量cache
+- 全相连(Set-associative)	-适合小容量cache
+- 组相连(Fully-associative)	-兼顾二者优点，避免二者缺点，被普遍采用
+
+# weak符号
+若两个或两个以上全局符号（函数或变量名）名字一样，而其中之一声明为weak symbol（弱符号），则这些全局符号不会引发重定义错误。链接器会忽略弱符号，去使用普通的全局符号来解析所有对这些符号的引用，但当普通的全局符号不可用时，链接器会使用弱符号。当有函数或变量名可能被用户覆盖时，该函数或变量名可以声明为一个弱符号。弱符号也称为weak alias（弱别名）
+
+举个例子，假设碰到这样问题：我们不确定外部模块是否提供一个函数func，但是我们不得不用这个函数，即自己模块的代码必须用到func函数：
+
+```
+extern int func(void);
+...................
+int a = func();
+if( a > .....)
+{
+    ..........
+}
+............
+```
+我们不知道func函数是否被定义了；
+这会导致2个结果：
+
+1：外部存在这个函数func，并且EXPORT_SYMBOL(func)，那么在我自己的模块使用这个函数func，正确。
+
+2：外部其实不存在这个函数，那么我们使用func，程序直接崩溃。
+
+所以这个时候，__attribute__((weak)) 派上了用场。
+
+在自己的模块中定义：
+```
+int  __attribute__((weak))  func(......)
+{
+    return 1;
+}
+```
+将本模块的func转成弱符号类型，如果遇到强符号类型（即外部模块定义了func），那么我们在本模块执行的func将会是外部模块定义的func。
+
+如果外部模块没有定义，那么，将会调用这个弱符号，也就是在本地定义的func，直接返回了一个1（返回值视具体情况而定）
+
+相当于增加了一个默认函数。
+
+原理：连接器发现同时存在弱符号和强符号，有限选择强符号，如果发现不存在强符号，只存在弱符号，则选择弱符号。如果都不存在：静态链接，恭喜，编译时报错，动态链接：对不起，系统无法启动。
+
+weak属性只会在静态库(.o .a )中生效，动态库(.so)中不会生效, 对于动态库，weak属性毫无作用，只取决于链接顺序，哪个先链接就用那个。
+
+# swap
+
+##  swap entry
+当一个页面被换出时，Linux 使用相应的 PTE 来存储足够的信息以再次在磁盘上定位该页面。显然，PTE 本身不足以精确存储页面在磁盘上的位置，但足以将索引存储到 swap_info中array 和swap_map中的偏移量。
+
+巧妙的利用被换出页面的pte来确定swap area和swap offset
+```
+参考：arch/arm64/include/asm/pgtable.h
+/*
+ * Encode and decode a swap entry:
+ *	bits 0-1:	present (must be zero)	// 置0，表示为swap entry
+ *	bits 2:		remember PG_anon_exclusive
+ *	bit  3:		remember uffd-wp state
+ *	bits 6-10:	swap type		// swap_info[]数组的索引，用于查找对应的swap area
+ *	bit  11:	PTE_PRESENT_INVALID (must be zero)
+ *	bits 12-61:	swap offset		// swap area/swap分区内的索引，用于查找对应slot
+ */
+#define __SWP_TYPE_SHIFT	6
+#define __SWP_TYPE_BITS		5
+#define __SWP_TYPE_MASK		((1 << __SWP_TYPE_BITS) - 1)
+#define __SWP_OFFSET_SHIFT	12
+#define __SWP_OFFSET_BITS	50
+#define __SWP_OFFSET_MASK	((1UL << __SWP_OFFSET_BITS) - 1)
+
+#define __swp_type(x)		(((x).val >> __SWP_TYPE_SHIFT) & __SWP_TYPE_MASK)
+#define __swp_offset(x)		(((x).val >> __SWP_OFFSET_SHIFT) & __SWP_OFFSET_MASK)
+#define __swp_entry(type,offset) ((swp_entry_t) { ((type) << __SWP_TYPE_SHIFT) | ((offset) << __SWP_OFFSET_SHIFT) })
+
+#define __pte_to_swp_entry(pte)	((swp_entry_t) { pte_val(pte) })
+#define __swp_entry_to_pte(swp)	((pte_t) { (swp).val })
+```
+swapout的entry保存
+
+try_to_unmap -> try_to_unmap_one
+
+swapin的entry取出及检索slot
+do_swap_page -> pte_to_swp_entry

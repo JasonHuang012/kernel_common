@@ -190,11 +190,33 @@ struct zone;
  *
  * We always assume that blocks are of size PAGE_SIZE.
  */
+/*
+ * swap_extent用于管理交换文件和swap分区对应磁盘的映射关系
+ * 因为交换文件可能是部分swap, 或者存储到磁盘时是碎片化存储，例如
+ *
+ * 交换文件逻辑空间（4KB页面）：
+ *	页面 0-99    → 磁盘块 1000-1099（连续）
+ *	页面 100-199 → 磁盘块 2000-2099（不连续，跳跃了）
+ *	页面 200-299 → 磁盘块 5000-5099（又不连续
+ *
+ *        swap_extent_root
+ *             |
+ *       [se1: 0-99]
+ *          /    \
+ *         /      \
+ *  [se2: 100-199] [se3: 200-299]
+ *
+ *	se1: {start_page=0, nr_pages=100, start_block=1000}
+ *	se2: {start_page=100, nr_pages=100, start_block=2000}
+ *	se3: {start_page=200, nr_pages=100, start_block=5000}
+ *
+ * zram不用swap_extent，因为zram是直接使用简单的线性数组 zram->table[]
+ */
 struct swap_extent {
 	struct rb_node rb_node;
-	pgoff_t start_page;
-	pgoff_t nr_pages;
-	sector_t start_block;
+	pgoff_t start_page;	// 文件起始页面（在交换文件中的逻辑偏移）
+	pgoff_t nr_pages;	// 连续的页面数量
+	sector_t start_block;	// 起始块号(磁盘的起始物理位置)
 };
 
 /*
@@ -246,21 +268,59 @@ enum {
  * The flags field determines if a cluster is free. This is
  * protected by cluster lock.
  */
+/*
+ * 我们知道swap_info_struct中的swap_map用于记录每个swap slot的使用情况，可以通过查询swap_map来寻找空闲的slot；
+ * 但如果系统同一时间有多个进程同进Swap操作，那么就会同时访问 swap_map[] 数组，从而产生资源竞争，
+ * 就需要全局的 spin_lock 来保护，在这种情况下如果系统中有 n个 cpu 同时访问这个数组，那么只能一个一个地访问，
+ * 从而阻塞了其它 cpu 的执行，而且随着CPU核心数增加，锁竞争会加剧。基于这个问题，把所有的页槽组织成以 256个
+ * 页槽为一个簇的链表，这样不同CPU可以同时访问不同的簇。
+ *
+ * 和zram不用swap_extent一样，zram也不用swap_cluster_info，因为zram是基于内存的，随机访问极快，无需磁盘优化策略;
+ * zram用的是内存中的zram->table[index]线性数组进行访问, 例如zram_get_handle(zram, index),
+ * 直接使用index从数组中获取zs_malloc分配的空间地址.
+ */
 struct swap_cluster_info {
 	spinlock_t lock;	/*
 				 * Protect swap_cluster_info fields
 				 * other than list, and swap_info_struct->swap_map
 				 * elements corresponding to the swap cluster.
 				 */
-	u16 count;
-	u8 flags;
-	u8 order;
-	struct list_head list;
+	u16 count;		// 当前cluster中已使用的页面数
+	u8 flags;		// cluster状态标志，具体见下面的CLUSTER_FLAG_*
+	u8 order;		// cluster大小等级，用于支持大页
+	struct list_head list;	// 链表节点，根据状态加入不同类型的链表，见下面的CLUSTER_FLAG_*
 };
-#define CLUSTER_FLAG_FREE 1 /* This cluster is free */
-#define CLUSTER_FLAG_NONFULL 2 /* This cluster is on nonfull list */
-#define CLUSTER_FLAG_FRAG 4 /* This cluster is on nonfull list */
-#define CLUSTER_FLAG_FULL 8 /* This cluster is on full list */
+
+/*
+ * 三个主要的链表:
+ * free_clusters     → [集群A] → [集群B] → [集群C] → ... (所有页面空闲)
+ * nonfull_clusters  → [集群D] → [集群E] → [集群F] → ... (部分页面使用)
+ * full_clusters     → [集群G] → [集群H] → [集群I] → ... (全部页面使用)
+ *
+ * 示例:
+ * +-------------------+
+ * | lock: 自旋锁      |
+ * | count: 5/256      | ← 已使用5个页面，总共256个
+ * | flags: NONFULL(2) | ← 非满状态
+ * | order: 0          | ← 标准大小（256页面）
+ * | list: [链表节点]  | ← 在nonfull_clusters链表中
+ * +-------------------+
+ *
+ * swap_cluster初始化接口： setup_clusters
+ *
+ * 场景：频繁分配释放导致碎片化
+ * 传统：swap_map: [1,0,1,0,1,0,1,0,1,0,...] 交替使用
+ *     每次分配都要线性扫描
+ *
+ * 集群：将256页面作为单元管理
+ *     只要集群内有空闲页面，就从nonfull链表快速分配
+ *     减少全局搜索开销
+ *
+ */
+#define CLUSTER_FLAG_FREE 1 /* This cluster is free */			// 完全空闲的cluster(集群)
+#define CLUSTER_FLAG_NONFULL 2 /* This cluster is on nonfull list */	// 部分使用的cluster
+#define CLUSTER_FLAG_FRAG 4 /* This cluster is on nonfull list */	// nonfull，碎片化的cluster
+#define CLUSTER_FLAG_FULL 8 /* This cluster is on full list */		// 已经用满的cluster
 
 /*
  * The first page in the swap file is the swap header, which is always marked
@@ -288,13 +348,28 @@ struct percpu_cluster {
 /*
  * The in-memory structure used to track swap areas.
  */
+/*
+ * swap_info_struct用于管理swap分区
+ * 每个swap分区都由一个si结构体管理
+ */
 struct swap_info_struct {
 	struct percpu_ref users;	/* indicate and keep swap device valid. */
 	unsigned long	flags;		/* SWP_USED etc: see above */
+	/* 这个swap分区的优先级, swap分区初始化时确定(setup_swap_info)，查找时按优先级高低查找对应槽位，how? 查找什么？*/
+	/* 在get_swap_pages中，按照优先级从高到低(prio数值越低，优先级越高)，从高优先级的swap分区开始查找空闲的slot */
 	signed short	prio;		/* swap priority of this type */
 	struct plist_node list;		/* entry in swap_active_head */
+	/*
+	 * 其实是index, 表示第几个swap分区，第一个创建的swap分区，type为0
+	 * 该变量同时也是 swap_info[] 全局变量的索引，即swap_info[0] 就是第一个 swap 分区的 swap_info_struct 结构体。
+	 * swap_info[] 数组保存着系统中所有swap 分区描述符，即 swap_info_struct 结构体
+	 */
 	signed char	type;		/* strange name for an index */
 	unsigned int	max;		/* extent of the swap_map */
+	/*
+	 * slot数组，用于统计swap分区每个slot的空闲情况/引用个数，一般是一个页面对应一个数组成员
+	 * 0表示slot空闲，n(>0)表示该页面被映射的进程数目
+	 */
 	unsigned char *swap_map;	/* vmalloc'ed array of usage counts */
 	unsigned long *zeromap;		/* kvmalloc'ed bitmap to track zero pages */
 	struct swap_cluster_info *cluster_info; /* cluster info. Only for SSD */
@@ -307,14 +382,24 @@ struct swap_info_struct {
 	unsigned int frag_cluster_nr[SWAP_NR_ORDERS];
 	unsigned int lowest_bit;	/* index of first free in swap_map */
 	unsigned int highest_bit;	/* index of last free in swap_map */
+	/*
+	 * swap分区可用的总页面数量
+	 * 如果是传统磁盘分区，要除去坏块; 如果是zram，等于zram分区大小/页面大小
+	 */
 	unsigned int pages;		/* total of usable pages of swap */
+	/*
+	 * 已经被swapout的页面数量
+	 * 比如有10个页面被压缩到zram分区，那inuse_pages即为10
+	 */
 	unsigned int inuse_pages;	/* number of those currently in use */
 	unsigned int cluster_next;	/* likely index for next allocation */
 	unsigned int cluster_nr;	/* countdown to next cluster search */
 	unsigned int __percpu *cluster_next_cpu; /*percpu index for next allocation */
 	struct percpu_cluster __percpu *percpu_cluster; /* per cpu's swap location */
 	struct rb_root swap_extent_root;/* root of the swap extent rbtree */
+	/* swap 分区所处于的块设备 struct block_device 结构体 */
 	struct block_device *bdev;	/* swap device or bdev of swap file */
+	/* swap分区对应的swap_file结构体 */
 	struct file *swap_file;		/* seldom referenced */
 	struct completion comp;		/* seldom referenced */
 	spinlock_t lock;		/*

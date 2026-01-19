@@ -615,7 +615,9 @@ static void __submit_bio(struct bio *bio)
 		blk_mq_submit_bio(bio);
 	} else if (likely(bio_queue_enter(bio) == 0)) {
 		struct gendisk *disk = bio->bi_bdev->bd_disk;
-
+		/*
+		 * zram: zram_submit_bio
+		 */
 		disk->fops->submit_bio(bio);
 		blk_queue_exit(disk->queue);
 	}

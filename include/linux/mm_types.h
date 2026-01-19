@@ -344,6 +344,11 @@ struct folio {
 				void *private;
 				swp_entry_t swap;
 			};
+			/*
+			 * -1     : 没有进程映射这个页面
+			 *  0     : 只有父进程映射了这个页面
+			 *  n (>0): 有多少个pte页面映射了这个页面
+			 */
 			atomic_t _mapcount;
 			atomic_t _refcount;
 #ifdef CONFIG_MEMCG

@@ -1833,18 +1833,25 @@ EXPORT_SYMBOL(page_cache_prev_miss);
  */
 void *filemap_get_entry(struct address_space *mapping, pgoff_t index)
 {
+	/* 重点1：利用mapping和index, 初始化xas */
 	XA_STATE(xas, &mapping->i_pages, index);
 	struct folio *folio;
 
 	rcu_read_lock();
 repeat:
 	xas_reset(&xas);
+	/* 重点2：从xarray中加载键值，也就是folio */
 	folio = xas_load(&xas);
 	if (xas_retry(&xas, folio))
 		goto repeat;
 	/*
 	 * A shadow entry of a recently evicted page, or a swap entry from
 	 * shmem/tmpfs.  Return it without attempting to raise page count.
+	 */
+	/*
+	 * 特殊页面处理：
+	 *	- 已经被回收的页面的shadow
+	 *	- shmem/tmpfs页面
 	 */
 	if (!folio || xa_is_value(folio))
 		goto out;

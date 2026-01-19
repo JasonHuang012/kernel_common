@@ -136,6 +136,7 @@ static inline swp_entry_t pte_to_swp_entry(pte_t pte)
 
 	pte = pte_swp_clear_flags(pte);
 	arch_entry = __pte_to_swp_entry(pte);
+	/* 根据swap type和swap offset, 获取对应swap分区的slot */
 	return swp_entry(__swp_type(arch_entry), __swp_offset(arch_entry));
 }
 

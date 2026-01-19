@@ -462,8 +462,9 @@ extern const struct address_space_operations empty_aops;
  * @i_private_list: For use by the owner of the address_space.
  * @i_private_data: For use by the owner of the address_space.
  */
+/* 一个address_space管理了一个文件在内存中缓存的所有文件页面 */
 struct address_space {
-	struct inode		*host;
+	struct inode		*host;		/* 文件的inode */
 	struct xarray		i_pages;
 	struct rw_semaphore	invalidate_lock;
 	gfp_t			gfp_mask;
@@ -472,6 +473,7 @@ struct address_space {
 	/* number of thp, only for non-shmem files */
 	atomic_t		nr_thps;
 #endif
+	/* immap管理address_space所属文件的多个VMAs映射 */
 	struct rb_root_cached	i_mmap;
 	unsigned long		nrpages;
 	pgoff_t			writeback_index;
