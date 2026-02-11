@@ -7753,6 +7753,10 @@ static int select_idle_smt(struct task_struct *p, struct sched_domain *sd, int t
 {
 	int cpu;
 
+	/*
+	 * cpu_smt_mask: 获取target cpu所处物理core的所有smt cpu
+	 * 逐个检查逻辑cpu是否符合
+	 */
 	for_each_cpu_and(cpu, cpu_smt_mask(target), p->cpus_ptr) {
 		if (cpu == target)
 			continue;
@@ -7825,12 +7829,14 @@ static int select_idle_cpu(struct task_struct *p, struct sched_domain *sd, bool 
 					continue;
 
 				if (has_idle_core) {
+					/* 如果有空闲物理cpu，优先寻找整个的空闲核心 */
 					i = select_idle_core(p, cpu, cpus, &idle_cpu);
 					if ((unsigned int)i < nr_cpumask_bits)
 						return i;
 				} else {
 					if (--nr <= 0)
 						return -1;
+					/* 检查单个cpu是否空闲 */
 					idle_cpu = __select_idle_cpu(cpu, p);
 					if ((unsigned int)idle_cpu < nr_cpumask_bits)
 						return idle_cpu;
@@ -7855,6 +7861,7 @@ static int select_idle_cpu(struct task_struct *p, struct sched_domain *sd, bool 
 		}
 	}
 
+	/* 如果之前检查到有空闲的物理core，但最后没选择，则清除标志 */
 	if (has_idle_core)
 		set_idle_cores(target, false);
 
@@ -7932,6 +7939,20 @@ static inline bool asym_fits_cpu(unsigned long util,
 /*
  * Try and locate an idle core/thread in the LLC cache domain.
  */
+/*
+ * 在LLC缓存域中寻找空闲的核心/线程
+ *
+ * 主要目标：为唤醒的任务选择最合适的CPU，考虑：
+ * 1. 缓存亲和性（cache affinity）
+ * 2. 空闲状态（idle状态）
+ * 3. 系统不对称性（asymmetric CPU capacity）
+ * 4. SMT超线程优化
+ *
+ * @p: 要唤醒的任务
+ * @prev: 任务上次运行的CPU
+ * @target: 默认目标CPU（通常由wake_affine等算法计算）
+ * @return: 选择的CPU编号
+ */
 static int select_idle_sibling(struct task_struct *p, int prev, int target)
 {
 	bool has_idle_core = false;
@@ -7943,11 +7964,15 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
 	 * On asymmetric system, update task utilization because we will check
 	 * that the task fits with CPU's capacity.
 	 */
+	/*
+	 * 对于不对称系统（如big.LITTLE），需要更新任务利用率
+	 * 因为需要检查任务是否适合CPU的容量
+	 */
 	if (sched_asym_cpucap_active()) {
-		sync_entity_load_avg(&p->se);
-		task_util = task_util_est(p);
-		util_min = uclamp_eff_value(p, UCLAMP_MIN);
-		util_max = uclamp_eff_value(p, UCLAMP_MAX);
+		sync_entity_load_avg(&p->se);			// 同步任务的负载平均值
+		task_util = task_util_est(p);			// 获取任务利用率估计值
+		util_min = uclamp_eff_value(p, UCLAMP_MIN);	// 最小利用率限制
+		util_max = uclamp_eff_value(p, UCLAMP_MAX);	// 最大利用率限制
 	}
 
 	/*
@@ -7955,6 +7980,7 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
 	 */
 	lockdep_assert_irqs_disabled();
 
+	/* 如果目标cpu合适，则直接使用该cpu */
 	if ((available_idle_cpu(target) || sched_idle_cpu(target)) &&
 	    asym_fits_cpu(task_util, util_min, util_max, target))
 		return target;
@@ -7962,6 +7988,7 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
 	/*
 	 * If the previous CPU is cache affine and idle, don't be stupid:
 	 */
+	/* 如果上次运行这个任务的cpu和目标cpu共享缓存且空闲，直接用上次的cpu，这样可以保持cache热度 */
 	if (prev != target && cpus_share_cache(prev, target) &&
 	    (available_idle_cpu(prev) || sched_idle_cpu(prev)) &&
 	    asym_fits_cpu(task_util, util_min, util_max, prev)) {
@@ -7990,6 +8017,7 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
 	}
 
 	/* Check a recently used CPU as a potential idle candidate: */
+	/* 检查最近使用过的cpu，作为一个潜在选择 */
 	recent_used_cpu = p->recent_used_cpu;
 	p->recent_used_cpu = prev;
 	if (recent_used_cpu != prev &&
@@ -8011,6 +8039,7 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
 	 * For asymmetric CPU capacity systems, our domain of interest is
 	 * sd_asym_cpucapacity rather than sd_llc.
 	 */
+	/* 对于不对称系统, 关注sd_asym_cpucapacity */
 	if (sched_asym_cpucap_active()) {
 		sd = rcu_dereference(per_cpu(sd_asym_cpucapacity, target));
 		/*
@@ -8027,13 +8056,22 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
 		}
 	}
 
+	/* 对于对称系统，关注sd_llc，现获取最后一级缓存的调度域 */
 	sd = rcu_dereference(per_cpu(sd_llc, target));
 	if (!sd)
 		return target;
 
+	/* 优先选择同一个物理core的逻辑cpu */
 	if (sched_smt_active()) {
-		has_idle_core = test_idle_cores(target);
+		has_idle_core = test_idle_cores(target);	// 测试是否有空闲物理core
 
+		/*
+		 * 如果没有空闲的物理cpu， 且prev和target共享缓存，则尝试选择smt的空闲逻辑cpus
+		 * 如果有空闲的物理cpu，就不考虑smt cpu，因为smt的效率肯定比物理cpu低
+		 * 同时也可以避免smt中的逻辑cpu之间的资源竞争
+		 *
+		 * 一般的优先级为：完全空闲的物理cpu  >  不同物理cpu的空闲逻辑cpu > 同一物理cpu的空闲逻辑cpu(且只有缓存亲和才选择)
+		 */
 		if (!has_idle_core && cpus_share_cache(prev, target)) {
 			i = select_idle_smt(p, sd, prev);
 			if ((unsigned int)i < nr_cpumask_bits)
@@ -8041,6 +8079,7 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
 		}
 	}
 
+	/* 在LLC域中扫描空闲cpu */
 	i = select_idle_cpu(p, sd, has_idle_core, target);
 	if ((unsigned)i < nr_cpumask_bits)
 		return i;
@@ -8050,6 +8089,12 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
 	 * LLC Tag, we tend to find an idle CPU in the target's cluster
 	 * first. But prev_cpu or recent_used_cpu may also be a good candidate,
 	 * use them if possible when no idle CPU found in select_idle_cpu().
+	 */
+	/*
+	 * 对于具有较低共享缓存（如L2或LLC标签）的集群机器，
+	 * 我们倾向于首先在目标集群中找到空闲CPU。
+	 * 但是prev_cpu或recent_used_cpu也可能是好的候选者，
+	 * 当在select_idle_cpu()中没有找到空闲CPU时，尽可能使用它们。
 	 */
 	if ((unsigned int)prev_aff < nr_cpumask_bits)
 		return prev_aff;

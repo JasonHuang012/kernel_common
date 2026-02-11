@@ -33,34 +33,95 @@ struct cpuidle_driver;
 #define CPUIDLE_STATE_DISABLED_BY_USER		BIT(0)
 #define CPUIDLE_STATE_DISABLED_BY_DRIVER	BIT(1)
 
+/*
+ * cpuidle的状态信息记录，一般会有几种cpu空闲状态，state0\state1等
+ * 节点路径：/sys/devices/system/cpu/cpu1/cpuidle/state0/
+ */
 struct cpuidle_state_usage {
-	unsigned long long	disable;
+	unsigned long long	disable;	// 是否禁用该状态
+	/* 进入该状态的次数，用于分析cpu空闲状态的使用频率 */
 	unsigned long long	usage;
+	/* 进入该状态的累计时间，用于计算平均驻留时间和功耗调优 */
 	u64			time_ns;
+	/*
+	 * too deep次数统计, 实际驻留次数 > 目标驻留次数
+	 * 当cpu实际空闲时间超过target_residency太多，表明这个状态too deep
+	 * 表示退出延迟开销不合理？
+	 */
 	unsigned long long	above; /* Number of times it's been too deep */
+	/*
+	 * too low次数统计，实际驻留次数 < 目标驻留次数
+	 * 当cpu实际空闲时间小于target_residency
+	 * 表示过早被唤醒？
+	 */
 	unsigned long long	below; /* Number of times it's been too shallow */
+	/*
+	 * 请求进入这个状态而被拒绝的次数
+	 * 可能是空闲时间不足、硬件限制等
+	 */
 	unsigned long long	rejected; /* Number of times idle entry was rejected */
 #ifdef CONFIG_SUSPEND
+	/*
+	 * s2idle： 系统级浅睡眠状态，比普通的空闲状态更深，但是比重启快
+	 *
+	 * s2idle_usage: s2idle次数
+	 * s2idle_time: s2idle时间
+	 */
 	unsigned long long	s2idle_usage;
 	unsigned long long	s2idle_time; /* in US */
 #endif
 };
 
 struct cpuidle_state {
+	/*
+	 * cpuidle state的名字
+	 * /sys/devices/system/cpu/cpu0/cpuidle# cat state0/name
+	 * WFI
+	 * /sys/devices/system/cpu/cpu0/cpuidle# cat state1/name
+	 * cpu-sleep-0
+	 */
 	char		name[CPUIDLE_NAME_LEN];
+	/*
+	 * cpuidle state的描述
+	 * /sys/devices/system/cpu/cpu0/cpuidle# cat state0/desc
+	 * ARM WFI
+	 * /sys/devices/system/cpu/cpu0/cpuidle# cat state1/desc
+	 * cpu-sleep-0
+	 */
 	char		desc[CPUIDLE_DESC_LEN];
 
+	/*
+	 * 退出延迟
+	 * 从该状态唤醒到运行状态所需的时间
+	 * 延迟越低、响应越快
+	 */
 	s64		exit_latency_ns;
+	/*
+	 * 目标驻留时间
+	 * 为了补偿退出延迟，cpu需要在这个状态至少停留的时间
+	 * 如果空闲时间 < target_residency_ns，选择更浅的状态更高效
+	 * 节省的功耗 > 退出延迟的功耗开销
+	 */
 	s64		target_residency_ns;
+	/* 状态标志，下面的CPUIDLE_FLAG_* */
 	unsigned int	flags;
 	unsigned int	exit_latency; /* in US */
+	/* 功耗，不同状态下功耗不同 */
 	int		power_usage; /* in mW */
 	unsigned int	target_residency; /* in US */
 
+	/*
+	 * 进入状态的函数
+	 * 进入该状态的操作，比如硬件特定的操作：MWAIT指令、关闭时钟、降低电压等
+	 */
 	int (*enter)	(struct cpuidle_device *dev,
 			struct cpuidle_driver *drv,
 			int index);
 
+	/*
+	 * 进入深度休眠
+	 * 用于cpu热插拔、当cpu下线时进入的状态
+	 */
 	int (*enter_dead) (struct cpuidle_device *dev, int index);
 
 	/*
@@ -71,10 +132,54 @@ struct cpuidle_state {
 	 * This callback may point to the same function as ->enter if all of
 	 * the above requirements are met by it.
 	 */
+	/*
+	 * 进入i2idle(系统挂起)
+	 */
 	int (*enter_s2idle)(struct cpuidle_device *dev,
 			    struct cpuidle_driver *drv,
 			    int index);
 };
+
+/*
+# 查看CPU0的所有空闲状态
+$ ls /sys/devices/system/cpu/cpu0/cpuidle/
+state0/ state1/ state2/ state3/ state4/
+
+# 查看C1状态的信息
+$ cat /sys/devices/system/cpu/cpu0/cpuidle/state1/name
+C1
+
+$ cat /sys/devices/system/cpu/cpu0/cpuidle/state1/desc
+MWAIT 0x00
+
+$ cat /sys/devices/system/cpu/cpu0/cpuidle/state1/latency
+1          # 1微秒退出延迟
+
+$ cat /sys/devices/system/cpu/cpu0/cpuidle/state1/residency
+2          # 目标驻留2微秒
+
+$ cat /sys/devices/system/cpu/cpu0/cpuidle/state1/power
+10         # 功耗10mW
+
+# 查看统计信息
+$ cat /sys/devices/system/cpu/cpu0/cpuidle/state1/usage
+125432     # 进入次数
+
+$ cat /sys/devices/system/cpu/cpu0/cpuidle/state1/time
+1234567890 # 总停留时间（纳秒）
+
+
+调优示例
+# 1. 禁用某个状态（如果发现它效率低）
+echo 1 > /sys/devices/system/cpu/cpu0/cpuidle/state2/disable
+
+# 2. 查看调优数据
+$ cat /sys/devices/system/cpu/cpu0/cpuidle/state2/below
+1523       # 1523次提前唤醒 → 这个状态可能太深
+
+$ cat /sys/devices/system/cpu/cpu0/cpuidle/state2/above
+23         # 只有23次过度休眠 → 状态选择还算合理
+*/
 
 /* Idle State Flags */
 #define CPUIDLE_FLAG_NONE       	(0x00)

@@ -66,16 +66,46 @@ static inline unsigned long topology_get_hw_pressure(int cpu)
 void topology_update_hw_pressure(const struct cpumask *cpus,
 				      unsigned long capped_freq);
 
+/*
+ * cpu拓扑结构体，用于描述多核cpu的层次化架构
+ *	- 向调度器提供cpu信息，用于调度任务；
+ *	- 向用户提供cpu结构信息;
+ */
 struct cpu_topology {
-	int thread_id;
-	int core_id;
-	int cluster_id;
-	int package_id;
-	cpumask_t thread_sibling;
-	cpumask_t core_sibling;
-	cpumask_t cluster_sibling;
-	cpumask_t llc_sibling;
+	int thread_id;			// 线程级ID，SMT的逻辑cpu core
+	int core_id;			// 物理cpu core ID
+	int cluster_id;			// cluster ID，NUMA或缓存簇
+	int package_id;			// 封装级ID，物理cpu插槽
+	cpumask_t thread_sibling;	// 同一个物理core的逻辑cpu
+	cpumask_t core_sibling;		// 同一cluster的物理cpu core
+	cpumask_t cluster_sibling;	// 同一封装的cluster
+	cpumask_t llc_sibling;		// 共享最后一级缓存的cpu
 };
+
+sched_smt_active
+/*
+id示例：
+Package 0 (物理CPU插槽)
+├── Cluster 0 (LLC共享域)
+│   ├── Core 0
+│   │   ├── Thread 0 (CPU0)  # thread_id=0, core_id=0, cluster_id=0, package_id=0
+│   │   └── Thread 1 (CPU8)  # thread_id=1, core_id=0, cluster_id=0, package_id=0
+│   ├── Core 1
+│   │   ├── Thread 0 (CPU1)  # thread_id=0, core_id=1, cluster_id=0, package_id=0
+│   │   └── Thread 1 (CPU9)  # thread_id=1, core_id=1, cluster_id=0, package_id=0
+└── Cluster 1 (另一个LLC域)
+    ├── Core 4
+    │   ├── Thread 0 (CPU4)  # thread_id=0, core_id=4, cluster_id=1, package_id=0
+    │   └──
+
+
+cpumask示例:
+// 对于CPU0（8核16线程系统）：
+thread_sibling = 0x0101    // CPU0和CPU8（同一核心的两个超线程）
+core_sibling   = 0x0F0F    // Core 0-3的所有线程（同一簇）
+cluster_sibling= 0xFFFF    // 所有CPU（单簇系统）
+llc_sibling    = 0x0F0F    // 共享LLC的CPU（Core 0-3）
+*/
 
 #ifdef CONFIG_GENERIC_ARCH_TOPOLOGY
 extern struct cpu_topology cpu_topology[NR_CPUS];
