@@ -393,8 +393,12 @@ static void show_free_areas(unsigned int filter, nodemask_t *nodemask, int max_z
 	}
 
 	printk("%ld total pagecache pages\n", global_node_page_state(NR_FILE_PAGES));
+	printk("%ld buffers, \n", nr_blockdev_pages());
+	printk("%ld cached, \n", global_node_page_state(NR_FILE_PAGES) - total_swapcache_pages()
 
 	show_swap_cache_info();
+	void show_shmem_tmpfs_info(void);
+	show_shmem_tmpfs_info();
 }
 
 void __show_mem(unsigned int filter, nodemask_t *nodemask, int max_zone_idx)

@@ -31,6 +31,9 @@
  * vmscan's shrink_folio_list.
  */
 static const struct address_space_operations swap_aops = {
+	/*
+	 * anonymous page的writepage，而shmem是shmem_writepage
+	 */
 	.writepage	= swap_writepage,
 	.dirty_folio	= noop_dirty_folio,
 #ifdef CONFIG_MIGRATION

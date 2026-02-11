@@ -5380,3 +5380,38 @@ struct page *shmem_read_mapping_page_gfp(struct address_space *mapping,
 	return page;
 }
 EXPORT_SYMBOL_GPL(shmem_read_mapping_page_gfp);
+
+void show_shmem_tmpfs_info(void)
+{
+
+	struct path path;
+	struct kstatfs buf;
+	char **pp;
+	char *tmpfs_paths[] = {
+		"/dev/shm",
+		"/tmp",
+		"/run",
+		"/var/run",
+		"/sys/fs/cgroup",
+		NULL
+	};
+
+	printk("Shmem tmpfs info:\n");
+	for (pp = tmpfs_paths; *pp; pp++) {
+		if (kern_path(*pp, LOOKUP_FOLLOW, &path) == 0) {
+			if (path.dentry->d_sb->s_type == &shmem_fs_type) {
+				if (vfs_statfs(&path, &buf) == 0) {
+					unsigned long long total = buf.f_blocks * buf.f_bsize;
+					unsigned long long free = buf.f_bfree * buf.f_bsize;
+
+					printk("%s: %llu total, %llu free, %llu used\n",
+						*pp, total/PAGE_SIZE, free/PAGE_SIZE, (total - free)/PAGE_SIZE);
+				}
+			}
+			path_put(&path);
+		}
+	}
+
+    return ;
+}
+EXPORT_SYMBOL(show_shmem_tmpfs_info);
