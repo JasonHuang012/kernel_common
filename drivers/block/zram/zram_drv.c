@@ -1311,6 +1311,10 @@ static bool zram_meta_alloc(struct zram *zram, u64 disksize)
 {
 	size_t num_pages, index;
 
+	/*
+	 * 根据zram配置的disksize，来分配table内存
+	 * 一个页面(原始数据)对应一个table
+	 */
 	num_pages = disksize >> PAGE_SHIFT;
 	zram->table = vzalloc(array_size(num_pages, sizeof(*zram->table)));
 	if (!zram->table)
@@ -1335,6 +1339,9 @@ static bool zram_meta_alloc(struct zram *zram, u64 disksize)
  * caller should hold this table index entry's bit_spinlock to
  * indicate this index entry is accessing.
  */
+/*
+ * 用于压缩数据的内存、zsmalloc分配的内存
+ */
 static void zram_free_page(struct zram *zram, size_t index)
 {
 	unsigned long handle;
@@ -1355,6 +1362,10 @@ static void zram_free_page(struct zram *zram, size_t index)
 
 	zram_set_priority(zram, index, 0);
 
+	/*
+	 * 对于写到块设备的页面，
+	 * 则只需释放块设备相关资源，不需要释放压缩内存
+	 */
 	if (zram_test_flag(zram, index, ZRAM_WB)) {
 		zram_clear_flag(zram, index, ZRAM_WB);
 		free_block_bdev(zram, zram_get_element(zram, index));
@@ -1365,16 +1376,25 @@ static void zram_free_page(struct zram *zram, size_t index)
 	 * No memory is allocated for same element filled pages.
 	 * Simply clear same page flag.
 	 */
+	/*
+	 * 相同页面没有分配实际的压缩内存,
+	 * 只需更新统计计数，不需释放内存
+	 */
 	if (zram_test_flag(zram, index, ZRAM_SAME)) {
 		zram_clear_flag(zram, index, ZRAM_SAME);
 		atomic64_dec(&zram->stats.same_pages);
 		goto out;
 	}
 
+	/*
+	 * 获取zram内存handle，一个handle对应一个zsmalloc内存
+	 * 如果没有handle，说明内存已经被释放了，或者未分配
+	 */
 	handle = zram_get_handle(zram, index);
 	if (!handle)
 		return;
 
+	/* 释放zsmalloc的内存 */
 	zs_free(zram->mem_pool, handle);
 
 	atomic64_sub(zram_get_obj_size(zram, index),

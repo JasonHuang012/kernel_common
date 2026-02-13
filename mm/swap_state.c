@@ -33,6 +33,12 @@
 static const struct address_space_operations swap_aops = {
 	/*
 	 * anonymous page的writepage，而shmem是shmem_writepage
+	 *
+	 * anonymous page:
+	 *	kswapd->shrink->pageout->swap_writepage->__swap_writepage-->zram write
+	 *
+	 * shmem page:
+	 *	kswapd->shrink->pageout->shmem_writepage->__swap_writepage->zram write
 	 */
 	.writepage	= swap_writepage,
 	.dirty_folio	= noop_dirty_folio,

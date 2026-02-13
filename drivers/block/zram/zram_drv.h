@@ -64,9 +64,22 @@ enum zram_pageflags {
 /* Allocated for each disk page */
 struct zram_table_entry {
 	union {
+		/* 指向zsmalloc分配内存 */
 		unsigned long handle;
 		unsigned long element;
 	};
+	/*
+	 * flags成员包含了flag和size信息
+	 * size是数据压缩后的大小，也即是需要的zsmalloc内存大小
+	 * flasg = zram_pageflag + compressed size
+	 *
+	 * flag占高(31-PAGE_SHIFT)位，size占据低几位
+	 * [31 - PAGE_SHIFT+1] : [PAGE_SHIFT - 0]
+	 *
+	 * page以4K为单位的话，PAGE_SHIFT为12
+	 * [31 - 13] : [12 - 0]
+	 * 其中每个flag的具体bit位置查看上面的enum zram_pageflags定义
+	 */
 	unsigned int flags;
 	spinlock_t lock;
 #ifdef CONFIG_ZRAM_TRACK_ENTRY_ACTIME
