@@ -142,6 +142,7 @@
  *  ZS_MIN_ALLOC_SIZE and ZS_SIZE_CLASS_DELTA must be multiple of ZS_ALIGN
  *  (reason above)
  */
+// page size 为4KB，则delta为16
 #define ZS_SIZE_CLASS_DELTA	(PAGE_SIZE >> CLASS_BITS)
 #define ZS_SIZE_CLASSES	(DIV_ROUND_UP(ZS_MAX_ALLOC_SIZE - ZS_MIN_ALLOC_SIZE, \
 				      ZS_SIZE_CLASS_DELTA) + 1)
@@ -2176,10 +2177,13 @@ struct zs_pool *zs_create_pool(const char *name)
 		struct size_class *class;
 		int fullness;
 
+		/* 从32开始到4096，间隔16 */
 		size = ZS_MIN_ALLOC_SIZE + i * ZS_SIZE_CLASS_DELTA;
 		if (size > ZS_MAX_ALLOC_SIZE)
 			size = ZS_MAX_ALLOC_SIZE;
+		/* 计算每个zspage由多少个page组成 */
 		pages_per_zspage = calculate_zspage_chain_size(size);
+		/* 每个zspage可以容纳多少个object */
 		objs_per_zspage = pages_per_zspage * PAGE_SIZE / size;
 
 		/*
