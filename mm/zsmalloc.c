@@ -867,6 +867,10 @@ static void __free_zspage(struct zs_pool *pool, struct size_class *class,
 static void free_zspage(struct zs_pool *pool, struct size_class *class,
 				struct zspage *zspage)
 {
+	/*
+	 * 合法性检查
+	 * 确保zspage没被使用且在链表中
+	 */
 	VM_BUG_ON(get_zspage_inuse(zspage));
 	VM_BUG_ON(list_empty(&zspage->list));
 
@@ -874,6 +878,11 @@ static void free_zspage(struct zs_pool *pool, struct size_class *class,
 	 * Since zs_free couldn't be sleepable, this function cannot call
 	 * lock_page. The page locks trylock_zspage got will be released
 	 * by __free_zspage.
+	 */
+	/*
+	 * 尝试拿锁
+	 * 失败，则走wq异步释放，async_free_zspage
+	 * 成功，则直接移出链表，并直接释放
 	 */
 	if (!trylock_zspage(zspage)) {
 		kick_deferred_free(pool);
@@ -1865,6 +1874,9 @@ static void async_free_zspage(struct work_struct *work)
 	struct zs_pool *pool = container_of(work, struct zs_pool,
 					free_work);
 
+	/*
+	 * 将所有class中使用率为0的zspage加入到free_pages临时链表
+	 */
 	for (i = 0; i < ZS_SIZE_CLASSES; i++) {
 		class = pool->size_class[i];
 		if (class->index != i)
@@ -1876,6 +1888,11 @@ static void async_free_zspage(struct work_struct *work)
 		spin_unlock(&class->lock);
 	}
 
+	/*
+	 * 遍历free_pages链表，将zspage从原来的链表中删除
+	 * 加锁，异步操作不怕阻塞，保证操作的原子性
+	 * 调用__free_zspage释放内存
+	 */
 	list_for_each_entry_safe(zspage, tmp, &free_pages, list) {
 		list_del(&zspage->list);
 		lock_zspage(zspage);
@@ -2130,6 +2147,13 @@ struct zs_pool *zs_create_pool(const char *name)
 	if (!pool)
 		return NULL;
 
+	/*
+	 * 注册用于异步释放zspage的wq: async_free_zspage
+	 * 当free_zspage同步释放内存失败时（锁竞争），则将释放操作放在wq中异步执行
+	 * 避免同步释放阻塞而影响释放效率
+	 *
+	 * 一种很好的性能优化思路！！
+	 */
 	init_deferred_free(pool);
 	rwlock_init(&pool->migrate_lock);
 	atomic_set(&pool->compaction_in_progress, 0);
@@ -2206,6 +2230,10 @@ struct zs_pool *zs_create_pool(const char *name)
 		spin_lock_init(&class->lock);
 		pool->size_class[i] = class;
 
+		/*
+		 * 初始化使用率链表
+		 * 0%\10%...99%\100%
+		 */
 		fullness = ZS_INUSE_RATIO_0;
 		while (fullness < NR_FULLNESS_GROUPS) {
 			INIT_LIST_HEAD(&class->fullness_list[fullness]);
@@ -2224,6 +2252,7 @@ struct zs_pool *zs_create_pool(const char *name)
 	 * registration fails we still can use the pool normally and user can
 	 * trigger compaction manually. Thus, ignore return code.
 	 */
+	/* 注册shrinker */
 	zs_register_shrinker(pool);
 
 	return pool;

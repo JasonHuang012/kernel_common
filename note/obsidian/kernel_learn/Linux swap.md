@@ -213,3 +213,23 @@ swapin流程
 3. 通过 zram_table[0x1000] 找到 zsmalloc handle
 4. 从 zsmalloc 解压缩数据到新分配的物理页面
 5. 将新页面加入 swap cache
+
+# zram驱动分析
+## zsmalloc
+
+zsmalloc是为内存压缩zram而实现的一种内存分配器，用于存放被压缩后的页面数据，以一个page为4KB为例子，一个页面被压缩后的数据肯定小于4KB，根据压缩算法及数据的简繁程度的不同，可能一个页面被压缩后的数据小到几十个字节、也可能还是接近于4KB。
+那为什么不直接使用slab分配呢？
+我们知道slab是用于分配较小、且物理连续的内存块，slab将多个大小相同的内存块对象放在同一个内存页面中，但是有时候这些对象不能正好把整个内存页面占满，导致产生内部碎片而造成浪费。比如一个3072字节大小的对象，只能占据3/4的页面空间，导致剩余的1/4空间被浪费。以前的内核版本尝试为这种情况分配多个连续的物理页面来减少内存的浪费，比如对于3072字节的对象，分配3个连续的物理页面，这样刚好3个对象刚好可以占满这3个页面，而不会造成碎片浪费。但是对于低内存设备，有时候很难分配到多个连续的物理页面，特别是在系统运行较长时间后。
+但是zram现在完全是由cpu实现，并不是一定要用物理连续的内存，只需要能映射为连续的虚拟内存即可，所以zsmalloc就产生了，zsmalloc像vmalloc一样申请的是多个物理不连续的页面(alloc_page())，唯一的区别是zsmalloc不要求马上为这些页面建立虚拟映射，因为考虑到32位系统虚拟地址空间有限，当使用object时再做映射(zs_map_object, 以页面为单位进行映射)，使用完object后解除映射(zs_unmap_object)。
+
+slab是以单个物理页面为一个内存块来分割object，而zsmalloc是将多个离散的物理页面作为一个组合页面，称为zspage，用于存放各类大小相同的object。
+zsmalloc和slab的kmalloc类似，也是有固定大小的object size，只不过zsmalloc比kmalloc有更多的粒度，4K页面为例子，有255种小于PAGE_SIZE的size，从32字节(ZS_MIN_ALLOC_SIZE)开始、每间隔16字节(ZS_SIZE_CLASS_DELTA)增加一个一类object。
+zsmalloc的object也被称为zpage，一个object/zpage可以跨越两个物理页面，比如一个object大小是2/3页面，则两个page可以容纳三个object。
+
+zsmalloc的使用流程：
+zs_create_pool-->zs_malloc-->zs_map_object-->object读写-->zs_unmap_object-->zs_free-->zs_destory_pool
+
+
+CONFIG_ZSMALLOC_CHAIN_SIZE
+
+
