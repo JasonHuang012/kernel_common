@@ -192,7 +192,7 @@ int fat_chain_add(struct inode *inode, int new_dclus, int nr_cluster)
 		fat_fs_error(sb, "clusters badly computed (%d != %llu), file %s",
 			     new_fclus,
 			     (llu)(inode->i_blocks >> (sbi->cluster_bits - 9)),
-			     !IS_ERR(s_dentry) ? s_dentry->d_iname: "unknown");
+			     (!IS_ERR(s_dentry) && s_dentry) ? (char *)s_dentry->d_iname : "unknown");
 		fat_cache_inval_inode(inode);
 	}
 	inode->i_blocks += nr_cluster << (sbi->cluster_bits - 9);	// 更新文件大小(块数)

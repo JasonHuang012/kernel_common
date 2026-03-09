@@ -1031,7 +1031,7 @@ __alloc_pages_noprof
       -->__perform_reclaim	// 直接回收
         -->try_to_free_pages	// 定义sc局部结构体
           -->do_try_to_free_pages
-            --> shrink_zones [__node_reclaim] [kswapd_shrink_node]
+            --> shrink_zones [__node_reclaim] [kswapd_shrink_node] //后面这两个接口业绩会调用到shrink_node
               --> shrink_node
 
 mem_cgroup_shrink_node
@@ -7610,7 +7610,10 @@ retry:
 		return sc->nr_reclaimed;
 
 	/* Aborted reclaim to try compaction? don't OOM, then */
-        /* 如果是因为要尝试内存规整而中止回收，返回1不触发OOM */
+        /*
+	 * 如果是因为要尝试内存规整而中止回收，返回1不触发OOMs
+	 * 返回1，使得在返回到__alloc_pages_slowpath时还有retry的可能，不至于直接oom
+	 */
 	if (sc->compaction_ready)
 		return 1;
 
@@ -7668,6 +7671,9 @@ retry:
 		goto retry;
 	}
 
+	/*
+	 * 连直接回收都回收不到页面，则返回0，触发oom
+	 */
 	return 0;
 }
 

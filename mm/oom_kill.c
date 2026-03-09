@@ -216,6 +216,7 @@ long oom_badness(struct task_struct *p, unsigned long totalpages)
 	 * unkillable or have been already oom reaped or the are in
 	 * the middle of vfork
 	 */
+	/* 设置/proc/<pid>/oom_score_adj为OOM_SCORE_ADJ_MIN(-1000)可以避免被杀 */
 	adj = (long)p->signal->oom_score_adj;
 	if (adj == OOM_SCORE_ADJ_MIN ||
 			test_bit(MMF_OOM_SKIP, &p->mm->flags) ||
@@ -227,6 +228,10 @@ long oom_badness(struct task_struct *p, unsigned long totalpages)
 	/*
 	 * The baseline for the badness score is the proportion of RAM that each
 	 * task's rss, pagetable and swap space use.
+	 */
+	/*
+	 * oom分数 = rss + swapents + pagetables
+	 * 就是谁的内存用的最多，谁就被杀，包括rss + 被交换出去的页面 + pagetables
 	 */
 	points = get_mm_rss(p->mm) + get_mm_counter(p->mm, MM_SWAPENTS) +
 		mm_pgtables_bytes(p->mm) / PAGE_SIZE;

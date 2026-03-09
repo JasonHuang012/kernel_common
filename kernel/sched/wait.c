@@ -219,12 +219,6 @@ void __wake_up_pollfree(struct wait_queue_head *wq_head)
 
 /*
  * Note: we use "set_current_state()" _after_ the wait-queue add,
- POLLFREE must have cleared the queue. */
-	WARN_ON_ONCE(waitqueue_active(wq_head));
-}
-
-/*
- * Note: we use "set_current_state()" _after_ the wait-queue add,
  * because we need a memory barrier there on SMP, so that any
  * wake-function that tests for the wait-queue being active
  * will be guaranteed to see waitqueue addition _or_ subsequent

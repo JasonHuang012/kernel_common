@@ -11977,11 +11977,11 @@ static int should_we_balance(struct lb_env *env)
 	->sched_balance_trigger
 		-> raise_softirq(SCHED_SOFTIRQ);
 			-> sched_balance_softirq
-				-> (1) nohz_idle_balance			//**nohz idle balancer**，拉取任务到已经进入idle的CPU
+				-> (1) nohz_idle_balance			// **nohz idle balancer**，拉取任务到已经进入idle的CPU
 					-> _nohz_idle_balance
 						-> sched_balance_domains(rq, CPU_IDLE);
 							-> sched_balance_rq
-				-> (2) sched_balance_domains(this_rq, idle);	//**periodic balancer**，周期性balance
+				-> (2) sched_balance_domains(this_rq, idle);	// **periodic balancer**，周期性balance
 					-> sched_balance_rq
 		-> nohz_balancer_kick(rq);
 			->kick_ilb
@@ -11990,7 +11990,7 @@ static int should_we_balance(struct lb_env *env)
  * pick_next_task (cfs fair)
 	->__pick_next_task_fair
 		->pick_next_task_fair
-			->sched_balance_newidle  (如果pick不到task)		//**newidle balancer**，CPU即将进入idle时发生
+			->sched_balance_newidle  (如果pick不到task)		// **newidle balancer**，CPU即将进入idle时发生
 				->sched_balance_rq
 
  * 负载均衡的三种类型

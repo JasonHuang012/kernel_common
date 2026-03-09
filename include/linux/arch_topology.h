@@ -82,7 +82,6 @@ struct cpu_topology {
 	cpumask_t llc_sibling;		// 共享最后一级缓存的cpu
 };
 
-sched_smt_active
 /*
 id示例：
 Package 0 (物理CPU插槽)

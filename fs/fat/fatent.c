@@ -356,7 +356,7 @@ static inline int fat_ent_update_ptr(struct super_block *sb,
 int fat_ent_read(struct inode *inode, struct fat_entry *fatent, int entry)
 {
 	struct super_block *sb = inode->i_sb;
-	struct msdos_sb_info *sbi = MSDOS_SB(inode->i_sb)
+	struct msdos_sb_info *sbi = MSDOS_SB(inode->i_sb);
 	const struct fatent_operations *ops = sbi->fatent_ops;
 	int err, offset;
 	sector_t blocknr;
@@ -658,7 +658,7 @@ int fat_free_clusters(struct inode *inode, int cluster)
 		if (err)
 			goto error;
 	}
-	/* 更新FAT表镜像，释放cluster也需要更新备份FAT表 *//
+	/* 更新FAT表镜像，释放cluster也需要更新备份FAT表 */
 	err = fat_mirror_bhs(sb, bhs, nr_bhs);
 error:
 	fatent_brelse(&fatent);
