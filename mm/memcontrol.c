@@ -1756,6 +1756,33 @@ static bool consume_stock(struct mem_cgroup *memcg, unsigned int nr_pages)
 /*
  * Returns stocks cached in percpu and reset cached information.
  */
+/*
+  Stock 的三种消费/归还方式
+
+  方式 A：下次分配直接消费 stock（最常见）
+
+  // 下次同 CPU 同 memcg 的 32 页分配：
+  consume_stock(memcg, 32)
+    → stock.nr_pages -= 32  （0 了）
+    → counter 不动
+  // 此时 counter.usage 恢复精确
+
+  方式 B：切换 cached memcg 时归还
+
+  // CPU0 换成 memcgB 了
+  __refill_stock(memcgB, ...)
+    if (stock->cached != memcgB)
+        drain_stock(stock)   // ← 先把 memcgA 的 stock 还回去
+            → page_counter_uncharge(&memcgA->memory, 32)  // counter.usage -= 32
+            → stock.nr_pages = 0
+
+  方式 C：stock 积累超过 MEMCG_CHARGE_BATCH 时自动 flush
+
+  __refill_stock(memcg, nr_pages):
+      stock_pages = stock->nr_pages + nr_pages
+      if (stock_pages > MEMCG_CHARGE_BATCH)
+          drain_stock(stock)   // ← 超过 64 了，把多余的还给 counter
+*/
 static void drain_stock(struct memcg_stock_pcp *stock)
 {
 	unsigned int stock_pages = READ_ONCE(stock->nr_pages);
@@ -2154,6 +2181,44 @@ out:
 	css_put(&memcg->css);
 }
 
+/*
+  try_charge_memcg()
+    ├─ [快速路径] consume_stock()         → 成功直接返回 0
+    ├─ page_counter_try_charge()          → 成功 → done_restock（检查 memory.high）
+    │   失败 ↓
+    ├─ batch 缩减重试                     → 再失败进入回收分支
+    ├─ [拦截] PF_MEMALLOC → force         → 强制记账，绕过回收
+    ├─ [拦截] task_in_memcg_oom → nomem
+    ├─ [拦截] !gfpflags_allow_blocking → nomem
+    │
+    └─ try_to_free_mem_cgroup_pages()     ← 真正触发回收
+         回收后若仍不足，进入多轮 retry：
+         ├─ margin 够 → goto retry
+         ├─ !drained → drain_all_stock → goto retry
+         ├─ __GFP_NORETRY → nomem
+         ├─ 有回收成果 && 小页 → goto retry
+         ├─ memcg1_wait_acct_move → goto retry
+         ├─ nr_retries-- (最多 16 次) → goto retry
+         ├─ __GFP_RETRY_MAYFAIL → nomem
+         └─ mem_cgroup_oom() → OOM kill → goto retry
+    └─ memory.high 软限制处理
+
+两种限制的对比
+
+  ┌───────────┬─────────────────────────────────────────────────────────┬─────────────────────────────────────────────────┐
+  │           │                  memory.max（硬限制）                   │              memory.high（软限制）              │
+  ├───────────┼─────────────────────────────────────────────────────────┼─────────────────────────────────────────────────┤
+  │ 触发时机  │ page_counter_try_charge 失败                            │ page_counter_try_charge 成功后检查              │
+  ├───────────┼─────────────────────────────────────────────────────────┼─────────────────────────────────────────────────┤
+  │ 回收方式  │ 同步，在充值路径中直接调用 try_to_free_mem_cgroup_pages │ 延迟，通过 set_notify_resume 在返回用户态时处理 │
+  ├───────────┼─────────────────────────────────────────────────────────┼─────────────────────────────────────────────────┤
+  │ 失败后果  │ 充值失败（-ENOMEM）或 OOM                               │ 充值成功但有延迟/节流惩罚                       │
+  ├───────────┼─────────────────────────────────────────────────────────┼─────────────────────────────────────────────────┤
+  │ 重试次数  │ 最多 17 次 + OOM 后重置                                 │ 单次 mem_cgroup_handle_over_high                │
+  ├───────────┼─────────────────────────────────────────────────────────┼─────────────────────────────────────────────────┤
+  │ swap 行为 │ memsw 超限时禁 swap                                     │ 不区分                                          │
+  └───────────┴─────────────────────────────────────────────────────────┴─────────────────────────────────────────────────┘
+*/
 int try_charge_memcg(struct mem_cgroup *memcg, gfp_t gfp_mask,
 		     unsigned int nr_pages)
 {
@@ -2169,11 +2234,28 @@ int try_charge_memcg(struct mem_cgroup *memcg, gfp_t gfp_mask,
 	unsigned long pflags;
 
 retry:
+	/*
+	 * per-cpu stock 快速路径
+	 * 从当前 CPU 的预充值缓存中扣减，完全无锁、无 counter 操作。条件：
+	 *	- 请求量 <= MEMCG_CHARGE_BATCH（64 pages，超大分配不用 stock）
+	 *	- 当前 CPU 的 stock 绑定的正好是这个 memcg
+	 *	- stock 余量 >= nr_pages
+	 */
 	if (consume_stock(memcg, nr_pages))
 		return 0;
 
 	if (!do_memsw_account() ||
 	    page_counter_try_charge(&memcg->memsw, batch, &counter)) {
+		/*
+		 * 记账成功，跳转到don_rerestock，处理overcharge
+		 * 对于小于MEMCG_CHARGE_BATCH个数的页面记账，会先charge 64，后面将多charge的数量放入cpu stock(refill_stock)
+		 * 这样下次小内存申请就可以直接走cpu stock快速路径，提高性能
+		 * 而不需要走完整的charge路径, 减少原子操作（page_counter_try_charge->atomic_long_add_return）
+		 *
+		 * 虽然会造成usage统计在某些时刻略微大于实际数据，
+		 * 但是这样可以用"短暂的数据不精确"换取"避免每次小分配都执行代价昂贵的 atomic_long_add_return + 层次遍历"。
+		 * 而且 counter.usage 是最终一致的（eventually consistent）：drain_stock()后一定回到精确值。
+		 */
 		if (page_counter_try_charge(&memcg->memory, batch, &counter))
 			goto done_restock;
 		if (do_memsw_account())
@@ -2184,10 +2266,12 @@ retry:
 		reclaim_options &= ~MEMCG_RECLAIM_MAY_SWAP;
 	}
 
+	/* 失败一次后，再以实际申请的内存页面数量再试一次 */
 	if (batch > nr_pages) {
 		batch = nr_pages;
 		goto retry;
 	}
+	/* 尝试两次都失败, usage超过max限制了，可能需要触发内存回收 */
 
 	/*
 	 * Prevent unbounded recursion when reclaim operations need to
@@ -2195,32 +2279,52 @@ retry:
 	 * but we prefer facilitating memory reclaim and getting back
 	 * under the limit over triggering OOM kills in these cases.
 	 */
+	/*
+	 * 拦截 1：PF_MEMALLOC → force 强制记账
+	 * kswapd、直接内存回收等流程本身就在释放内存，其内部的内存分配需求若再触发回收 → 无限递归死锁。
+	 * force 路径强制超限记账，暂时突破 limit。
+	 */
 	if (unlikely(current->flags & PF_MEMALLOC))
 		goto force;
 
+	/* 拦截 2：当前进程已在 OOM 处理中 → 直接失败 */
 	if (unlikely(task_in_memcg_oom(current)))
 		goto nomem;
 
+	/* 拦截 3：原子上下文 / 不允许阻塞 → 直接失败
+	 * GFP_ATOMIC、中断上下文等不能睡眠，无法同步等待回收结果。
+	 */
 	if (!gfpflags_allow_blocking(gfp_mask))
 		goto nomem;
 
+	/* 上报max事件 */
 	memcg_memory_event(mem_over_limit, MEMCG_MAX);
 	raised_max_event = true;
 
 	psi_memstall_enter(&pflags);
+	/*
+	 * mem_over_limit: 超过max usage限制的memcg，可能是当前memcg也可能是父级memcg
+	 * 尝试回收该memcg的内存, 回收数量：最少nr_pages
+	 */
 	nr_reclaimed = try_to_free_mem_cgroup_pages(mem_over_limit, nr_pages,
 						    gfp_mask, reclaim_options, NULL);
 	psi_memstall_leave(&pflags);
 
+	/* 判断 1：回收后 margin 够了 → 直接重试充值 */
 	if (mem_cgroup_margin(mem_over_limit) >= nr_pages)
 		goto retry;
 
+	/*
+	 * 判断 2：还没 drain 过 stock → drain 所有 CPU 的预充值缓存再试
+	 * （stock 里有预充值的页面还没反映到 counter，drain 后可能腾出空间）
+	 */
 	if (!drained) {
 		drain_all_stock(mem_over_limit);
 		drained = true;
 		goto retry;
 	}
 
+	/* 判断 3：__GFP_NORETRY → 不想等，直接失败 */
 	if (gfp_mask & __GFP_NORETRY)
 		goto nomem;
 	/*
@@ -2232,22 +2336,27 @@ retry:
 	 * unlikely to succeed so close to the limit, and we fall back
 	 * to regular pages anyway in case of failure.
 	 */
+	 /* 判断 4：虽然 margin 不够，但回收有成果 && 是小页（≤8 pages）→ 还值得试 */
 	if (nr_reclaimed && nr_pages <= (1 << PAGE_ALLOC_COSTLY_ORDER))
 		goto retry;
 	/*
 	 * At task move, charge accounts can be doubly counted. So, it's
 	 * better to wait until the end of task_move if something is going on.
 	 */
+	/* 判断 5：v1 task move 进行中（双重计数情况）→ 等它结束 */
 	if (memcg1_wait_acct_move(mem_over_limit))
 		goto retry;
 
+	/* 判断 6：还有重试次数（MAX_RECLAIM_RETRIES = 16）→ 继续 */
 	if (nr_retries--)
 		goto retry;
 
+	/* 判断 7：__GFP_RETRY_MAYFAIL → 已尽力，失败 */
 	if (gfp_mask & __GFP_RETRY_MAYFAIL)
 		goto nomem;
 
 	/* Avoid endless loop for tasks bypassed by the oom killer */
+	/* 判断8： 如果oom要杀的正是当前进程，失败退出 */
 	if (passed_oom && task_is_dying())
 		goto nomem;
 
@@ -2256,10 +2365,11 @@ retry:
 	 * a forward progress or bypass the charge if the oom killer
 	 * couldn't make any progress.
 	 */
+	/* 判断 8：OOM kill */
 	if (mem_cgroup_oom(mem_over_limit, gfp_mask,
 			   get_order(nr_pages * PAGE_SIZE))) {
 		passed_oom = true;
-		nr_retries = MAX_RECLAIM_RETRIES;
+		nr_retries = MAX_RECLAIM_RETRIES; // OOM后重置 重试次数，再走一轮
 		goto retry;
 	}
 nomem:
@@ -2269,6 +2379,7 @@ nomem:
 	 * put the burden of reclaim on regular allocation requests
 	 * and let these go through as privileged allocations.
 	 */
+	/* 走到这里：OOM kill 没成功 → nomem */
 	if (!(gfp_mask & (__GFP_NOFAIL | __GFP_HIGH)))
 		return -ENOMEM;
 force:
@@ -2292,6 +2403,7 @@ force:
 
 done_restock:
 	if (batch > nr_pages)
+		/* overcharge的放回cpu stock */
 		refill_stock(memcg, batch - nr_pages);
 
 	/*
@@ -2302,6 +2414,10 @@ done_restock:
 	 * not recorded as it most likely matches current's and won't
 	 * change in the meantime.  As high limit is checked again before
 	 * reclaim, the cost of mismatch is negligible.
+	 */
+	/*
+	 * 注意：以上所有回收都是针对 memory.max 硬限制超限。memory.high 软限制走完全不同的路径：
+	 * 下面处理超出memory.high的
 	 */
 	do {
 		bool mem_high, swap_high;
@@ -2331,6 +2447,7 @@ done_restock:
 			 * based on how much each task is actually allocating.
 			 */
 			current->memcg_nr_pages_over_high += batch;
+			/* set_notify_resume，在返回用户态时处理 */
 			set_notify_resume(current);
 			break;
 		}
@@ -2343,9 +2460,11 @@ done_restock:
 	 * kernel. If this is successful, the return path will see it
 	 * when it rechecks the overage and simply bail out.
 	 */
+	/* 如果超出限制的量很多，立即同步处理一次（不等返回用户态）*/
 	if (current->memcg_nr_pages_over_high > MEMCG_CHARGE_BATCH &&
 	    !(current->flags & PF_MEMALLOC) &&
 	    gfpflags_allow_blocking(gfp_mask))
+		/* reclaim_high-->try_to_free_mem_cgroup_pages */
 		mem_cgroup_handle_over_high(gfp_mask);
 	return 0;
 }
@@ -3417,6 +3536,9 @@ struct mem_cgroup *mem_cgroup_get_from_ino(unsigned long ino)
 }
 #endif
 
+/*
+ * 为memcg在每个node上分配一个struct mem_cgroup_per_node
+ */
 static bool alloc_mem_cgroup_per_node_info(struct mem_cgroup *memcg, int node)
 {
 	struct mem_cgroup_per_node *pn;

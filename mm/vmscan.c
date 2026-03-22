@@ -1081,7 +1081,6 @@ kswapd
 						--> shrink_inactive_list
 					--> shrink_slab
 
-
 */
 
 /*
@@ -1440,7 +1439,7 @@ static bool may_enter_fs(struct folio *folio, gfp_t gfp_mask)
 	- 遍历处理完folio_list的所有页面后，开始处理demote_folios和ret_folios链表;
 	- 调用**demote_folio_list()**, 迁移需要降级的页面到其它node，对于本地node也算是回收；
 	- 降级失败的页面重新放回folio_list;
-	- 处理free_it没释放的页面（数量不够进行批量释放），还是调用free_unref_folios()释放；
+	- 处理free_list没释放的页面（数量不够进行批量释放），还是调用free_unref_folios()释放；
 	- 将ret_folios放回folio_list，返回后调用者会将其放回LRU链表；
 	- 最后返回成功回收的页面数量；
  */
@@ -1459,7 +1458,10 @@ static unsigned int shrink_folio_list(struct list_head *folio_list,
 	folio_batch_init(&free_folios);
 	memset(stat, 0, sizeof(*stat));
 	cond_resched();
-	/* 检查当前节点是否允许进行内存降级（demotion），并且扫描控制结构未明确禁止 */
+	/*
+	 * 检查当前节点是否允许进行内存降级（demotion, 也就是能否将当前node的页面迁移到其它node），
+	 * 并且扫描控制结构未明确禁止
+	 */
 	do_demote_pass = can_demote(pgdat->node_id, sc);
 
 retry:
@@ -1608,7 +1610,7 @@ retry:
 
 			/* Case 2 above */
 			/*
-			 * 如果是全局回收或者是新memcg回收
+			 * 如果是全局回收(kswap或者直接回收)或者是新memcg回收
 			 * 遇到正在writeback且还没有设置reclaim的页面
 			 * 先标记reclaim标志，再放回LRU链表
 			 * 可能等到下次回收，writeback就完成了，可以被回收
@@ -3290,7 +3292,7 @@ static void prepare_scan_control(pg_data_t *pgdat, struct scan_control *sc)
  * nr[2] = file inactive folios to scan; nr[3] = file active folios to scan
  */
 /*
- * 确定每个可回收列表的扫描页面的数量，保存到nr数组中
+ * 确定每个LRU链表的页面扫描数量，保存到nr数组中
  *	- nr[0] = anon inactive 要扫描的页数
  *	- nr[1] = anon active   要扫描的页数（更多是用于老化/降级）
  *	- nr[2] = file inactive 要扫描的页数
@@ -3839,6 +3841,26 @@ static struct mm_struct *get_next_mm(struct lru_gen_mm_walk *walk)
 	mm = list_entry(mm_state->head, struct mm_struct, lru_gen.list);
 	key = pgdat->node_id % BITS_PER_TYPE(mm->lru_gen.bitmap);
 
+	/*
+	 * 如果bitmap没置位，则跳过该mm
+	 *
+	 * bitmap 由调度器的 finish_task_switch() 和 exec 路径通过 lru_gen_use_mm() 置位：
+
+		// kernel/sched/core.c:5410
+		lru_gen_use_mm(next->mm);   // ← 每次上下文切换到该进程时
+
+		// fs/exec.c:1016
+		lru_gen_use_mm(mm);         // ← exec 时
+
+		static inline void lru_gen_use_mm(struct mm_struct *mm)
+		{
+		WRITE_ONCE(mm->lru_gen.bitmap, -1);  // 所有 bit 全置 1
+		}
+
+	 * 结论：
+		只有"自上次老化以来曾被调度运行过"的进程，其 mm 才会被扫描（bitmap != 0）；
+	 *	从未运行的进程自动跳过。 force_scan=true 时忽略此过滤，强扫所有 mm。
+	 */
 	if (!walk->force_scan && !test_bit(key, &mm->lru_gen.bitmap))
 		return NULL;
 
@@ -3987,6 +4009,16 @@ static void reset_mm_stats(struct lru_gen_mm_walk *walk, bool last)
 	}
 }
 
+/*
+ * iterate_mm_list() 以 mm_list->fifo 为环形链表，使用 mm_state->head 作为游标，每次调用取一个 mm：
+
+   fifo head → mm_A → mm_B → mm_C → mm_D → (回到 fifo head = 结束)
+                        ↑
+                  mm_state->head（当前游标）
+
+ * 当 mm_state->head 绕回 &mm_list->fifo 时，设 mm_state->seq++（推进轮次），
+ * 返回 last=true，告知调用者"本轮所有 mm 均已处理完毕"。
+ */
 static bool iterate_mm_list(struct lru_gen_mm_walk *walk, struct mm_struct **iter)
 {
 	bool first = false;
@@ -4162,6 +4194,21 @@ static bool positive_ctrl_err(struct ctrl_pos *sp, struct ctrl_pos *pv)
 	 * Return true if the PV has a limited number of refaults or a lower
 	 * refaulted/total than the SP.
 	 */
+	/*
+	 * 下面的第二个条件做了算术转换，等价于：
+	 * pv->refault / (pv->total * pv->gain) <= (sp->refault + 1) / ((sp->total + MIN_LRU_BATCH) * sp->gain)
+	 *
+	 * 用tierN替换pv，也就是当前tier；用tier0替换sp
+	 * tierN->refault / (tierN->total * 2) <= (tier0->refault + 1) / ((tier0->total + MIN_LRU_BATCH) * 1)
+	 *
+	 * 去掉常数：
+	 * tierN->refault / (tierN->total) <= (tier0->refault / tier0->total) * 2
+	 *
+	 * 返回false即是：
+	 * tierN->refault / (tierN->total) > (tier0->refault / tier0->total) * 2
+	 * 也就是tierN的refault大于tier0 refault率的两倍
+	 * 也可以说是tierN的refault率远远大于tier0的refault率
+	 */
 	return pv->refaulted < MIN_LRU_BATCH ||
 	       pv->refaulted * (sp->total + MIN_LRU_BATCH) * sp->gain <=
 	       (sp->refaulted + 1) * pv->total * pv->gain;
@@ -4172,57 +4219,279 @@ static bool positive_ctrl_err(struct ctrl_pos *sp, struct ctrl_pos *pv)
  ******************************************************************************/
 
 /* promote pages accessed through page tables */
+/*
+ * 页面被访问了，调用folio_update_gen提升到最新的gen（max_seq % MAX_NR_GENS）
+ * CAS无锁操作，不移动链表，只更新flags
+ */
 static int folio_update_gen(struct folio *folio, int gen)
 {
 	unsigned long new_flags, old_flags = READ_ONCE(folio->flags);
 
+	/* 最大gen是3 */
 	VM_WARN_ON_ONCE(gen >= MAX_NR_GENS);
+	/* 调用者必须持有RCU读锁，应为folio_memcg()需要RCU或者memcg pages lock保护memcg稳定 */
 	VM_WARN_ON_ONCE(!rcu_read_lock_held());
 
 	do {
 		/* lru_gen_del_folio() has isolated this page? */
+		/*
+		 * 判断页面是否已经被lru_gen_del_folio隔离
+		 * flags快照中的LRU_GEN为0，说明页面不在MGLRU链表中了
+		 (
+		 * gen保存时会+1，正常挂在LRU链表上的folio LRU_GEN >= 1，
+		 * 如果LRU_GEN段为0，说明这个folio不在LRU链表上、被隔离了
+		 */
 		if (!(old_flags & LRU_GEN_MASK)) {
 			/* for shrink_folio_list() */
+			/*
+			 * 隔离状态说明 folio 正在被 shrink_folio_list() 处理
+			 * 此时无法更新代号，但可以设置 PG_referenced 作为"曾被访问"的标记
+			 * shrink_folio_list() 会检查这个 bit 决定是否回收，相关代码：
+			 *
+			 * if (lru_gen_enabled() && !ignore_references &&
+			 *	folio_mapped(folio) && folio_test_referenced(folio))
+			 *		goto keep_locked;   // ← 这个 folio 不被驱逐，放回 LRU
+			 *
+			 * folio_update_gen本身的目的是将页面提升到最新的gen，如果folio被隔离了，能做的最多就是设置PG_referenced，留下一个"访问记录"
+			 * 让 shrink_folio_list 知道"这个页刚被访问过，别驱逐它"，然后通过 move_folios_to_lru 将其重新放回MGLRU，再等下次被 aging 路径扫到时完成真正的 gen 更新。
+			 */
 			new_flags = old_flags | BIT(PG_referenced);
+			/*
+			 * question:
+			 * 这里是continue，是不是设置PG_referenced后，要等到shrink_folio_list重新将页面放入MGLRU链表才能往下走？
+			 * 不是啊，这里continue后会跳到while中的CAS写入，分两种情况：
+			 *	1.如果flags没被改动，则将new_flags更新到folio->flags后退出
+			 *	2.如果flags被改动了，则更新old_flags，在下一次或者后面某一次，folio->flags会和old_flags一样，最后成功将new_flags写入并退出
+			 */
 			continue;
 		}
 
+		/*
+		 * 清除旧的代号、引用计数、引用相关 flags
+		 *	LRU_GEN_MASK:  旧代号字段
+		 *	LRU_REFS_MASK: 旧的 LRU_REFS 位域（tier 计数）
+		 *	LRU_REFS_FLAGS: PG_referenced | PG_workingset
+		 * 全部清零，在新代里从 tier 0 重新开始计数
+		 */
 		new_flags = old_flags & ~(LRU_GEN_MASK | LRU_REFS_MASK | LRU_REFS_FLAGS);
+		/*
+		 * 写入 gen+1
+		 * 保存的时候 +1，获取的时候-1 (folio_lru_gen), 为了区分出不在MGLRU链表的页面
+		 */
 		new_flags |= (gen + 1UL) << LRU_GEN_PGOFF;
+	/*
+	 * CAS：若 folio->flags 未被其他 CPU 修改，则原子写入new_flags
+	 * 否则将folio->flags更新到old_flags，并重试
+	 */
 	} while (!try_cmpxchg(&folio->flags, &old_flags, new_flags));
 
+	/* 返回folio原来的gen (未更新前的) */
 	return ((old_flags & LRU_GEN_MASK) >> LRU_GEN_PGOFF) - 1;
 }
+/*
+ * 调用lru_update_gen的所有场景及函数调用链
+ *
+ * 场景 1：walk_pte_range() - PTE 级别页表扫描
+ * 场景 2：walk_pmd_range_locked() - PMD 级别大页扫描
+ *	场景 1 & 2都是aging 路径的页表扫描，共用一条调用链
+  ★ kswapd 入口
+  kswapd()
+    └─ balance_pgdat()                            [mm/vmscan.c:8477]
+         └─ kswapd_shrink_node()                  [mm/vmscan.c:8360]
+              └─ shrink_node()                    [mm/vmscan.c:7229]
+
+  ★ 直接回收入口
+  try_to_free_pages()                             [mm/vmscan.c:7989]
+    └─ do_try_to_free_pages()                     [mm/vmscan.c:7676]
+         └─ shrink_zones()                        [mm/vmscan.c:7581]
+              └─ shrink_node()                    [mm/vmscan.c:7229]
+
+  ★ memcg 回收入口
+  try_to_free_mem_cgroup_pages()                  [mm/vmscan.c:8077]
+    └─ do_try_to_free_pages()
+         └─ shrink_zones()
+              └─ shrink_node()                    [mm/vmscan.c:7229]
+
+  ★ NUMA 节点回收入口
+  node_reclaim()                                  [mm/vmscan.c:9288]
+    └─ __node_reclaim()                           [mm/vmscan.c:9235]
+         └─ shrink_node()                         [mm/vmscan.c:7229]
+
+                    ↓（共同路径）
+
+  shrink_node()                                   [mm/vmscan.c:7229]
+    └─ lru_gen_shrink_node()                      [mm/vmscan.c:6130]
+         └─ shrink_many()                         [mm/vmscan.c:6039]
+              └─ shrink_one()                     [mm/vmscan.c:6018]
+                   └─ try_to_shrink_lruvec()      [mm/vmscan.c:5976]
+                        └─ get_nr_to_scan()       [mm/vmscan.c:5933]
+                             └─ try_to_inc_max_seq()  [mm/vmscan.c:5028]
+                                  └─ walk_mm()    [mm/vmscan.c:4760]
+                                       └─ walk_page_range()  [mm/vmscan.c:4789]
+                                            └─ walk_pud_range()  [mm/vmscan.c:4739]
+                                                 └─ walk_pmd_range()  [mm/vmscan.c:4703]
+                                                      ├─ walk_pte_range()       [mm/vmscan.c:4496]
+                                                      │    └─ folio_update_gen()  ← 调用点1 [vmscan.c:4548]
+                                                      │
+                                                      └─ walk_pmd_range_locked() [mm/vmscan.c:4562]
+                                                           └─ folio_update_gen()  ← 调用点2 [vmscan.c:4632]
+ * 场景1说明：
+ *	在页表扫描过程中，遍历 PTE 表项，检测页面的访问位（Accessed bit）。如果页面被访问过（young），将其提升到最新 gen（new_gen = max_seq % MAX_NR_GENS）。
+ * 场景2说明：
+ *	处理 PMD 级别的大页（THP - Transparent Huge Pages）。在扫描 PMD 表项时，如果检测到大页被访问，同样提升到最新 gen。
+
+ * 场景 3：回收路径的反向映射邻近扫描
+
+  ★ （同上的 kswapd / 直接回收 / memcg / NUMA 入口）
+                    ↓
+  shrink_node()                                   [mm/vmscan.c:7229]
+    └─ lru_gen_shrink_node()                      [mm/vmscan.c:6130]
+         └─ shrink_many()                         [mm/vmscan.c:6039]
+              └─ shrink_one()                     [mm/vmscan.c:6018]
+                   └─ try_to_shrink_lruvec()      [mm/vmscan.c:5976]
+                        └─ evict_folios()         [mm/vmscan.c:5548]
+                             └─ shrink_folio_list()  [mm/vmscan.c:1447]
+                                  └─ lru_gen_look_around()  [mm/vmscan.c:5207]
+                                       └─ folio_update_gen()  ← 调用点3 [vmscan.c:5290]
+ * 场景3说明：
+ *	在回收路径中，通过反向映射（rmap）检查目标 folio 周围的邻近页面。如果邻近页面也被访问过，一并提升到最新 gen，避免误驱逐热页。
+ */
+
 
 /* protect pages accessed multiple times through file descriptors */
+/*
+ * 保护页面，页面是指那些通过fd多次访问的页面，比如sys read
+ * 为了在回收的路径中，保护页面不被驱逐
+ *
+ * 目标是将页面向前推进一代（向新的代推进），
+ * 如果发现页面已经被移动到更新的代，则直接返回
+ */
 static int folio_inc_gen(struct lruvec *lruvec, struct folio *folio, bool reclaiming)
 {
 	int type = folio_is_file_lru(folio);
 	struct lru_gen_folio *lrugen = &lruvec->lrugen;
+	/*
+	 * old_gen: 由min_seq获取当前MGLRU对应type中最老的gen
+	 *
+	 * 对于进入回收路径的folio，我们期望它所在的gen是最老的、或者说它所在的gen就应该是最老的
+	 * 所以在后面的循环里会用这个最老的gen，来判断folio在后面有没有被移动移动到更新的gen
+	 */
 	int new_gen, old_gen = lru_gen_from_seq(lrugen->min_seq[type]);
+	/* 进入下面的循环前，先保存folio->flags的快照，因为后续可能会被异步更新 */
 	unsigned long new_flags, old_flags = READ_ONCE(folio->flags);
 
 	VM_WARN_ON_ONCE_FOLIO(!(old_flags & LRU_GEN_MASK), folio);
 
 	do {
+		/* 从flags快照中获取folio所在的gen */
 		new_gen = ((old_flags & LRU_GEN_MASK) >> LRU_GEN_PGOFF) - 1;
 		/* folio_update_gen() has promoted this page? */
+		/*
+		 * 两个判断条件：
+		 * 1.new_gen >= 0，说明folio仍在MGLRU中
+		 *	    == -1，说明被隔离移除了(lru_gen_del_folio)
+		 *
+		 * 2.new_gen != old_gen，说明folio已经已经被移动到更新的gen了(异步提升)
+		 *	     == old_gen，说明folio仍然在最老的gen
+		 *
+		 * 第一次走到这里，分几种情况：
+		 * 1.new_gen == -1，这种情况基本不存在
+		 *	-1表示页面不在MGLRU链表中了，可能的场景是在回收路径中被隔离（lru_gen_del_folio）, 而这个操作也是需要拿MGLRU锁的，所以对于同一个folio来说，不存在这种情况
+		 *
+		 * 2.new_gen >=0 并且 new_gen == old_gen
+		 *	说明在这期间，页面没有被异步提升，所以继续往下执行，直接提升gen，下次循环到这里判断new_gen != old_gen后（因为被提升了，所以不相等），再退出
+		 *
+		 * 3.new_gen >=0 并且 new_gen != old_gen
+		 *	说明在这期间，页面被被异步提升到最新的代（folio_update_gen），所以这里直接退出即可
+		 */
 		if (new_gen >= 0 && new_gen != old_gen)
+			/*
+			 * 直接返回new_gen，已经被提升到最新的代码了，调用者将其放到最新的代即可
+			 * 不走下面的size统计更新，因为这个folio的gen没有变动
+			 */
 			return new_gen;
 
+		/* gen+1 */
 		new_gen = (old_gen + 1) % MAX_NR_GENS;
 
+		/* 清除旧代号、旧 tier 信息，写入新代号 */
 		new_flags = old_flags & ~(LRU_GEN_MASK | LRU_REFS_MASK | LRU_REFS_FLAGS);
 		new_flags |= (new_gen + 1UL) << LRU_GEN_PGOFF;
 		/* for folio_end_writeback() */
+		/*
+		 * 回收路径中对于正在writebakc的液界面，会设置reclaiming标志
+		 * 这时候要设置PG_reclaim给wirteback最后阶段的folio_end_writebacak()判断条件是从
+		 * 回写完成时，发现PG_reclaim被置位，则会将folio移动回正确的LRU位置（待研究）
+		 */
 		if (reclaiming)
 			new_flags |= BIT(PG_reclaim);
-	} while (!try_cmpxchg(&folio->flags, &old_flags, new_flags));
 
+	/*
+	 * CSA，compare and swap，无锁原子操作
+	 * static __always_inline bool
+	 * atomic_long_try_cmpxchg_release(atomic_long_t *v, long *old, long new)
+	 *	如果v 和 old的值相等，则将new的内容更新到v指向的内存中，返回true；
+	 *	如果v 和 old的值不等，则v不变，将v的值更新到old指向的内存中，返回false；
+	 */
+	} while (!try_cmpxchg(&folio->flags, &old_flags, new_flags));
+	/*
+	 * folio gen变动，需要更新size统计
+	 * 与 folio_update_gen 的关键区别：这里直接更新，不走批量 batch 路径
+	 */
 	lru_gen_update_size(lruvec, folio, old_gen, new_gen);
 
 	return new_gen;
 }
+/*
+  folio_update_gen（老化路径）和 folio_inc_gen（回收路径）可能并发作用于同一个 folio：
+
+  CPU 0（老化路径）                    CPU 1（回收路径）
+  walk_pte_range:                      sort_folio:
+    发现 folio 在 gen=3（min_seq代）     扫到同一个 folio（gen=3，min_seq代）
+    调用 folio_update_gen(folio, 2)      old_gen = lru_gen_from_seq(min_seq) = 3
+    → CAS 将 flags 中代号改为 2+1=3     读 flags → 发现代号已经是 2+1=3（被 CPU0 改了）
+                                         new_gen = 3-1 = 2，old_gen = 3
+                                         new_gen(2) != old_gen(3) → 提前返回 2
+                                         ← 不做任何操作，尊重老化路径的结果
+
+  folio_inc_gen 的第 ⑥ 步竞争检测（new_gen != old_gen）就是专门处理这个 race 的。检测到 folio 已被老化路径提升后，直接返回新代号，不再重复操作。
+
+  而 shrink_folio_list() 中也有一处对应处理（vmscan.c:1518）：
+
+  // folio_update_gen() tried to promote this page?
+  if (lru_gen_enabled() && !ignore_references &&
+      folio_mapped(folio) && folio_test_referenced(folio))
+      goto keep_locked;   // PG_referenced 由隔离后的 folio_update_gen 设置，保留不驱逐
+
+  当 folio 已被隔离（LRU_GEN_MASK=0），folio_update_gen 无法更新代号，改为设置 PG_referenced；shrink_folio_list 看到这个 bit 后放弃驱逐，完成最后一道保护。
+
+
+  ┌─────────────┬─────────────────────────────────────────────┬──────────────────────────────────────────┐
+  │    维度     │              folio_update_gen               │              folio_inc_gen               │
+  ├─────────────┼─────────────────────────────────────────────┼──────────────────────────────────────────┤
+  │ 调用路径    │ 页表遍历（老化路径）                        │ 回收扫描 + min_seq 推进                  │
+  ├─────────────┼─────────────────────────────────────────────┼──────────────────────────────────────────┤
+  │ 目标代号    │ 调用方指定（总是 max_seq 对应 gen）         │ 固定 = old_gen + 1                       │
+  ├─────────────┼─────────────────────────────────────────────┼──────────────────────────────────────────┤
+  │ 跨代幅度    │ 可跨越多代（从任意旧代直达最新代）          │ 恰好 +1 代                               │
+  ├─────────────┼─────────────────────────────────────────────┼──────────────────────────────────────────┤
+  │ 大小统计    │ 不更新，延迟到 update_batch_size() 批量处理 │ 立即更新 lru_gen_update_size()           │
+  ├─────────────┼─────────────────────────────────────────────┼──────────────────────────────────────────┤
+  │ 需要 LRU 锁 │ 不需要（CAS + RCU 保护）                    │ 需要（调用方持有）                       │
+  ├─────────────┼─────────────────────────────────────────────┼──────────────────────────────────────────┤
+  │ 竞争检测    │ 无（它是"发起方"）                          │ 有（检测是否已被 folio_update_gen 提升） │
+  ├─────────────┼─────────────────────────────────────────────┼──────────────────────────────────────────┤
+  │ PG_reclaim  │ 不设置                                      │ reclaiming=true 时设置                   │
+  └─────────────┴─────────────────────────────────────────────┴──────────────────────────────────────────┘
+
+ * question:
+ *	folio_inc_gen是把folio向前推进一代，也就是往新的代推进
+ *	因为seq，新的代永远是在前面的，但是代码只是简单的+1，如果这时候gen是按照0、1、2、3排序的，也就是gen[0]是最老的，
+ *	有没有可能对gen[3]的folio进行folio_gen_inc使得这个folio被移除gen[0], 也就是最老的一代？
+ *
+ * answer:
+ *	不会，因为在folio_inc_gen中一旦检测到gen发生变化（不是最老的一代）,则直接退出
+ */
 
 static void update_batch_size(struct lru_gen_mm_walk *walk, struct folio *folio,
 			      int old_gen, int new_gen)
@@ -4452,6 +4721,7 @@ restart:
 		if (!folio)
 			continue;
 
+		/*  读取页表的access bit，如果被访问过则继续往下，没被访问则返回检查下一个folio*/
 		if (!ptep_clear_young_notify(args->vma, addr, pte + i))
 			continue;
 
@@ -4463,7 +4733,9 @@ restart:
 		      !folio_test_swapcache(folio)))
 			folio_mark_dirty(folio);
 
+		/* 页面被访问过，将其提升到最新的gen */
 		old_gen = folio_update_gen(folio, new_gen);
+		/* 如果folio原来就在new_gen, 则不需要更新size，反之则更新(延迟批量更新) */
 		if (old_gen >= 0 && old_gen != new_gen)
 			update_batch_size(walk, folio, old_gen, new_gen);
 	}
@@ -4753,6 +5025,20 @@ static void clear_mm_walk(void)
 		kfree(walk);
 }
 
+/*
+ * 强制推进 min_seq[type]：将当前最老代（gen=min_seq%4）的所有 folio
+ * 通过 folio_inc_gen 迁移到次老代（gen+1），然后 min_seq++。
+ *
+ * 使用场景：
+ * 1. inc_max_seq() 内部：当代数已满（nr_gens==MAX_NR_GENS=4）时，
+ *    必须先驱逐最老代的代槽，才能腾出空间给新代。
+ * 2. 间接被 try_to_inc_min_seq() 调用（已验证无效情况直接 goto done）。
+ *
+ * 批量处理：每次最多迁移 MAX_LRU_BATCH 个 folio，避免长时间持锁，
+ * 若未处理完则返回 false，调用者需循环重试。
+ *
+ * 调用者持有 lruvec->lru_lock。
+ */
 static bool inc_min_seq(struct lruvec *lruvec, int type, bool can_swap)
 {
 	int zone;
@@ -4775,6 +5061,9 @@ static bool inc_min_seq(struct lruvec *lruvec, int type, bool can_swap)
 			VM_WARN_ON_ONCE_FOLIO(folio_is_file_lru(folio) != type, folio);
 			VM_WARN_ON_ONCE_FOLIO(folio_zonenum(folio) != zone, folio);
 
+			/*
+			 * 将folio的gen加1，并移动到新的gen链表中
+			 */
 			new_gen = folio_inc_gen(lruvec, folio, false);
 			list_move_tail(&folio->lru, &lrugen->folios[new_gen][type][zone]);
 
@@ -4784,11 +5073,25 @@ static bool inc_min_seq(struct lruvec *lruvec, int type, bool can_swap)
 	}
 done:
 	reset_ctrl_pos(lruvec, type, true);
+	/* 推进min_seq */
 	WRITE_ONCE(lrugen->min_seq[type], lrugen->min_seq[type] + 1);
 
 	return true;
 }
 
+/*
+ * 尝试"免费"推进 min_seq：不强制迁移 folio（不调用 folio_inc_gen），
+ * 只扫描最老代 gen 槽是否已经完全为空，若为空则直接推进 min_seq。
+ *
+ * 语义：若最老代恰好没有任何 folio（自然清空，例如已被 eviction 驱逐完），
+ * 则 min_seq 可以"跳过"这一代，不需要为每个 folio 单独做迁移操作。
+ *
+ * 调用点：evict_folios()（在持有 lru_lock 时调用），紧接在 isolate_folios 之后，
+ * 利用刚刚批量隔离造成的"老代变空"机会推进 min_seq。
+ *
+ * 返回 true  = 至少推进了一个 type 的 min_seq；
+ * 返回 false = 两个 type 均无法推进。
+ */
 static bool try_to_inc_min_seq(struct lruvec *lruvec, bool can_swap)
 {
 	int gen, type, zone;
@@ -4798,16 +5101,26 @@ static bool try_to_inc_min_seq(struct lruvec *lruvec, bool can_swap)
 
 	VM_WARN_ON_ONCE(!seq_is_valid(lruvec));
 
+       /*
+        * 对每个 type 独立扫描：尝试将 min_seq[type] 向前推进，跳过空代。
+        *
+        * 起始 type：
+        * - can_swap=false → !can_swap=1 → type 从 LRU_GEN_FILE(1) 开始，跳过 ANON
+        * - can_swap=true  → !can_swap=0 → type 从 LRU_GEN_ANON(0) 开始，两个都扫
+        */
 	/* find the oldest populated generation */
 	for (type = !can_swap; type < ANON_AND_FILE; type++) {
 		while (min_seq[type] + MIN_NR_GENS <= lrugen->max_seq) {
+			/* 当前 min_seq 对应的 gen 槽索引 */
 			gen = lru_gen_from_seq(min_seq[type]);
 
+			/* 检查该 gen 槽在所有 zone 中是否都没有 folio */
 			for (zone = 0; zone < MAX_NR_ZONES; zone++) {
 				if (!list_empty(&lrugen->folios[gen][type][zone]))
 					goto next;
 			}
 
+			/* 所有 zone 均为空，此代可以丢弃，本地推进 min_seq */
 			min_seq[type]++;
 		}
 next:
@@ -4832,37 +5145,80 @@ next:
 	return success;
 }
 
+/*
+ * 真正执行 MGLRU 老化的函数：将 max_seq 原子地加 1，创建一个新的最年轻代。
+ *
+ * 老化的本质：max_seq++ 使得原来的最新代变成次新代，新的最新代（max_seq 对应的
+ * gen 槽）初始为空，等待新访问的页面被 folio_update_gen() 提升进来。
+ *
+ * inc_max_seq就是增加一个最新的gen，而且是空的，等待新访问的页面被加进来;
+ * 使得以前的最新代变老的，变为次新代了。
+ *
+ * 参数：
+ *   lruvec     - 目标 lruvec（每个 memcg 每个 node 一个）
+ *   seq        - 调用者读取的 max_seq 快照，用于并发检测
+ *   can_swap   - 是否允许回收匿名页（影响 min_seq 推进策略）
+ *   force_scan - 是否强制老化（即使代数已满 MAX_NR_GENS 也强制推进 min_seq）
+ *
+ * 返回值：
+ *   true  - 本次老化成功，max_seq 已被本线程推进
+ *   false - 老化失败，max_seq 已被其他线程推进（并发场景下的正常结果）
+ */
 static bool inc_max_seq(struct lruvec *lruvec, unsigned long seq,
 			bool can_swap, bool force_scan)
 {
-	bool success;
-	int prev, next;
-	int type, zone;
-	struct lru_gen_folio *lrugen = &lruvec->lrugen;
+	bool success;  /* 标记本次老化是否由本线程完成 */
+	int prev, next;  /* prev: max_seq-1 对应的 gen 索引；next: max_seq+1 对应的 gen 索引 */
+	int type, zone;  /* 循环变量：页面类型（ANON/FILE）和内存区域（zone） */
+	struct lru_gen_folio *lrugen = &lruvec->lrugen;  /* 取 lruvec 的 MGLRU 核心结构 */
 restart:
+	/* 无锁乐观检查：若 max_seq 已超过快照值 seq，说明其他线程已完成老化，无需重复 */
 	if (seq < READ_ONCE(lrugen->max_seq))
 		return false;
 
+	/* 加锁，准备正式执行老化（需要修改 max_seq 等共享数据） */
 	spin_lock_irq(&lruvec->lru_lock);
 
+	/* 调试断言：验证 seq 的合法性（FILE gens 在 [MIN_NR_GENS, MAX_NR_GENS] 内，ANON >= FILE） */
 	VM_WARN_ON_ONCE(!seq_is_valid(lruvec));
 
+	/* 加锁后二次确认：防止在乐观检查和加锁之间的窗口期内被其他线程抢先推进 */
 	success = seq == lrugen->max_seq;
+	/* max_seq 已被其他线程推进，本次老化不需要执行，跳到 unlock */
 	if (!success)
 		goto unlock;
 
+	/*
+	 * 检查是否存在代数已满（nr_gens == MAX_NR_GENS == 4）的情况。
+	 * max_seq++ 要求 nr_gens < MAX_NR_GENS，否则新代会溢出 4 代上限。
+	 * 若某个 type 已有 4 代，需先调用 inc_min_seq() 强制推进 min_seq，
+	 * 将最老代的页面迁移到次老代，腾出一个代的槽位。
+	 * 注意：倒序遍历（FILE 先于 ANON），确保文件页优先处理。
+	 */
 	for (type = ANON_AND_FILE - 1; type >= 0; type--) {
+		/* 当前 type 的代数未满，无需处理，继续检查下一个 type */
 		if (get_nr_gens(lruvec, type) != MAX_NR_GENS)
 			continue;
 
+		/*
+		 * 健全性检查：正常回收路径下（非 force_scan），代数满说明回收严重滞后。
+		 * FILE type 或允许 swap 时不应出现代满（回收应该及时推进 min_seq）。
+		 */
 		VM_WARN_ON_ONCE(!force_scan && (type == LRU_GEN_FILE || can_swap));
 
+		/* 尝试推进 min_seq[type]，将最老代的页面批量迁移到次老代（folio_inc_gen） */
+		/* inc_min_seq 每次最多处理 MAX_LRU_BATCH 个 folio，避免长时间持锁 */
 		if (inc_min_seq(lruvec, type, can_swap))
+			/* min_seq 推进成功，该 type 代数已降为 3，继续检查下一个 type */
 			continue;
 
+		/*
+		 * inc_min_seq 返回 false：最老代页面过多，本批次未处理完。
+		 * 释放锁，让出 CPU 后重新从 restart 开始，分批处理，避免软锁死。
+		 */
 		spin_unlock_irq(&lruvec->lru_lock);
-		cond_resched();
-		goto restart;
+		cond_resched();  /* 主动让出 CPU，避免长时间占用导致 soft lockup */
+		goto restart;    /* 重新从乐观检查开始，确保 seq 仍然有效 */
 	}
 
 	/*
@@ -4871,49 +5227,105 @@ restart:
 	 * with min_seq[LRU_GEN_ANON] if swapping is constrained. And if they do
 	 * overlap, cold/hot inversion happens.
 	 */
+	/*
+	 * 计算 prev 和 next 的 gen 环形索引（gen = seq % MAX_NR_GENS）：
+	 * prev = (max_seq - 1) % 4：当前次新代的 gen 槽索引
+	 * next = (max_seq + 1) % 4：max_seq++ 后新最新代将占用的 gen 槽索引
+	 * 注意：next 槽在 max_seq++ 后将成为新的最年轻代（初始为空），
+	 * 而该槽此前可能存有上一轮回收后残留的旧数据（若 swap 受限导致冷热倒置）。
+	 */
 	prev = lru_gen_from_seq(lrugen->max_seq - 1);
 	next = lru_gen_from_seq(lrugen->max_seq + 1);
 
+	/*
+	 * 同步更新传统 active/inactive LRU 计数，保持与内核其他子系统的兼容性。
+	 * （/proc/meminfo、vmstat 等仍依赖传统的 LRU_ACTIVE_ANON 等计数）
+	 * 逻辑：prev 代（即将成为次新代，视为 inactive）与 next 代（将被清空，
+	 * 当前可能有残留旧数据）的页面数之差，需要同步反映到 inactive/active 计数中。
+	 */
 	for (type = 0; type < ANON_AND_FILE; type++) {
 		for (zone = 0; zone < MAX_NR_ZONES; zone++) {
+			/* lru 为传统 LRU 中该 type 对应的 inactive 链表枚举值 */
 			enum lru_list lru = type * LRU_INACTIVE_FILE;
+			/* delta = prev 代页数 - next 代页数（next 代正常情况下为 0） */
 			long delta = lrugen->nr_pages[prev][type][zone] -
 				     lrugen->nr_pages[next][type][zone];
 
+			/* 差值为 0 无需更新，跳过 */
 			if (!delta)
 				continue;
 
+			/* inactive 计数加 delta（prev 代视为 inactive） */
 			__update_lru_size(lruvec, lru, zone, delta);
+			/* active 计数减 delta（与 inactive 保持总量一致） */
 			__update_lru_size(lruvec, lru + LRU_ACTIVE, zone, -delta);
 		}
 	}
 
+	/* 重置 PID 控制器的历史统计数据，为新代建立干净的 refault/evict 统计起点 */
 	for (type = 0; type < ANON_AND_FILE; type++)
 		reset_ctrl_pos(lruvec, type, false);
 
+	/* 记录新代（next 槽）的创建时间戳，供老化间隔统计使用 */
 	WRITE_ONCE(lrugen->timestamps[next], jiffies);
 	/* make sure preceding modifications appear */
+	/*
+	 * 这里真正将max_seq加1
+	 *
+	 * 使用 smp_store_release 发布屏障：确保前面所有对 lrugen 的修改
+	 * 对其他 CPU 可见后，才发布新的 max_seq 值，防止乱序导致其他 CPU
+	 * 看到新 max_seq 但看不到配套的统计更新。
+	 */
 	smp_store_release(&lrugen->max_seq, lrugen->max_seq + 1);
 unlock:
+	/* 释放 LRU 锁 */
 	spin_unlock_irq(&lruvec->lru_lock);
 
+	/* 返回本次老化是否由本线程完成（true=成功推进，false=被抢先） */
 	return success;
 }
 
+/*
+ * MGLRU 老化的入口函数：在调用 inc_max_seq() 推进 max_seq 之前，
+ * 先遍历 mm_list（进程地址空间列表），扫描页表中的 accessed 位，
+ * 将被访问的页面从旧代提升到新代，以便老化决策基于最新的访问信息。
+ *
+ * 参数：
+ *   lruvec     - 目标 lruvec（对应一个 memcg × pgdat 的组合）
+ *   seq        - 调用者观察到的 max_seq 值（用于并发保护）
+ *   can_swap   - 是否允许扫描匿名页映射（swap 是否可用）
+ *   force_scan - 是否强制扫描全部 mm（忽略 mm 的年龄判断）
+ *
+ * 返回值：true = 本线程完成了一次完整的老化（max_seq 已推进）；
+ *         false = 被其他线程抢先完成，本线程未推进 max_seq。
+ */
 static bool try_to_inc_max_seq(struct lruvec *lruvec, unsigned long seq,
 			       bool can_swap, bool force_scan)
 {
-	bool success;
-	struct lru_gen_mm_walk *walk;
-	struct mm_struct *mm = NULL;
-	struct lru_gen_folio *lrugen = &lruvec->lrugen;
+	bool success;  /* 标记本线程是否完成了完整的 mm_list 遍历并成功推进 max_seq */
+	struct lru_gen_mm_walk *walk;  /* 页表扫描的 walk 上下文（per-cpu 缓存分配） */
+	struct mm_struct *mm = NULL;  /* 当前正在扫描的进程 mm_struct（NULL 表示尚未取到） */
+	struct lru_gen_folio *lrugen = &lruvec->lrugen;  /* 本 lruvec 的 MGLRU 代数据 */
+	/* mm_state：管理 mm_list 遍历进度的状态结构；仅当开启了 MGLRU mm tracking 时非 NULL */
 	struct lru_gen_mm_state *mm_state = get_mm_state(lruvec);
 
+	/* 断言：调用者传入的 seq 不能超过当前 max_seq（seq 只能等于或落后于 max_seq） */
 	VM_WARN_ON_ONCE(seq > READ_ONCE(lrugen->max_seq));
 
+	/*
+	 * mm_state 为 NULL 表示此 lruvec 没有关联的 mm_list（例如内核线程专属 memcg、
+	 * 或 CONFIG_LRU_GEN_WALKS_MMU 未开启），无需页表扫描，直接推进 max_seq。
+	 */
 	if (!mm_state)
 		return inc_max_seq(lruvec, seq, can_swap, force_scan);
 
+	/*
+	 * mm_state->seq 记录上一次完整 mm_list 遍历时对应的 max_seq 值。
+	 * 若 seq <= mm_state->seq，说明当前 seq 轮次的 mm_list 已被其他线程
+	 * 遍历完毕（iterate_mm_list 已将 mm_state->seq 推进到 seq），
+	 * 本线程无需重复扫描，返回 false 表示"已被抢先完成"。
+	 * （详见 iterate_mm_list() 中的注释）
+	 */
 	/* see the comment in iterate_mm_list() */
 	if (seq <= READ_ONCE(mm_state->seq))
 		return false;
@@ -4924,33 +5336,97 @@ static bool try_to_inc_max_seq(struct lruvec *lruvec, unsigned long seq,
 	 * handful of PTEs. Spreading the work out over a period of time usually
 	 * is less efficient, but it avoids bursty page faults.
 	 */
+	/*
+	 * should_walk_mmu() 返回 false：硬件不自动维护 PTE accessed 位（如某些 ARM 平台），
+	 * 主动扫描页表意义不大（accessed 位不可靠）。
+	 * 退化为 iterate_mm_list_nowalk()：仅推进 mm_state->seq，不真正扫描页表，
+	 * 由 lru_gen_look_around()（缺页中断路径）负责少量 PTE 的 accessed 位清理，
+	 * 虽效率略低，但可避免集中扫描带来的缺页中断突发。
+	 */
 	if (!should_walk_mmu()) {
-		success = iterate_mm_list_nowalk(lruvec, seq);
+		success = iterate_mm_list_nowalk(lruvec, seq);  /* 仅更新 mm_state->seq，不扫页表 */
 		goto done;
 	}
 
+	/*
+	 * 从 per-cpu 缓存分配 lru_gen_mm_walk 上下文。
+	 * 第二个参数 true 表示允许阻塞分配（direct reclaim 路径），
+	 * false 则只使用 per-cpu 缓存（kswapd 路径可能传 false）。
+	 */
 	walk = set_mm_walk(NULL, true);
 	if (!walk) {
+		/* 分配失败（内存紧张），退化为 nowalk 路径 */
 		success = iterate_mm_list_nowalk(lruvec, seq);
 		goto done;
 	}
 
-	walk->lruvec = lruvec;
-	walk->seq = seq;
-	walk->can_swap = can_swap;
-	walk->force_scan = force_scan;
+	/* 初始化 walk 上下文，绑定目标 lruvec 及本次老化的参数 */
+	walk->lruvec = lruvec;      /* 目标 lruvec，walk_mm 将把访问到的页面提升至此 lruvec */
+	walk->seq = seq;            /* 本次老化对应的 max_seq，防止跨轮次错误提升 */
+	walk->can_swap = can_swap;  /* 是否扫描匿名页映射（需 swap 支持） */
+	walk->force_scan = force_scan;  /* 是否忽略 mm 的时间戳，强制全量扫描 */
 
+	/*
+	 * 逐个取出 memcg->mm_list 中的 mm_struct 并扫描其页表：
+	 *
+	 * - iterate_mm_list()：从 memcg的mm_list FIFO 队列取下一个 mm，
+	 *   若本轮遍历已完成（所有 mm 均处理完毕）则返回 success=true，
+	 *   同时将 mm_state->seq 推进到 seq，防止其他线程重复扫描；
+	 *   mm_list FIFO链表存放的是所有隶属于该memcg的、仍在运行的用户进程的地址空间（内核线程没有mm，不在链表中）
+	 *   相关操作接口：
+	 *   ┌────────────────────────┬──────────────┬────────────────────────────────────────────────┐
+	 *   │          操作          │    调用点    │                    触发时机                    │
+	 *   ├────────────────────────┼──────────────┼────────────────────────────────────────────────┤
+	 *   │ lru_gen_add_mm(mm)     │ mm_init()    │ 进程创建时，mm 初始化后加入 memcg 的 mm_list   │
+	 *   ├────────────────────────┼──────────────┼────────────────────────────────────────────────┤
+	 *   │ lru_gen_del_mm(mm)     │ __mmdrop()   │ 进程退出，mm 引用计数归零时移出                │
+	 *   ├────────────────────────┼──────────────┼────────────────────────────────────────────────┤
+	 *   │ lru_gen_migrate_mm(mm) │ memcg 迁移时 │ 进程被移入新 memcg，mm 在新旧 mm_list 之间迁移 │
+	 *   └────────────────────────┴──────────────┴────────────────────────────────────────────────┘
+	 *
+	 * - walk_mm()：对取到的 mm 进行页表扫描，将 accesse bit被置位 对应的
+	 *   folio 通过 folio_update_gen() 提升到最新代（max_seq % MAX_NR_GENS）；
+	 *
+	 * - 循环直到 iterate_mm_list() 返回 mm=NULL（本批次无更多 mm 可处理）。
+	 *   其中iterate_mm_list()-->get_next_mm()会跳过哪些近期没有运行的task的mm
+	 */
 	do {
-		success = iterate_mm_list(walk, &mm);
+		success = iterate_mm_list(walk, &mm);  /* 取下一个 mm；success=true 表示完整遍历完成 */
 		if (mm)
-			walk_mm(mm, walk);
-	} while (mm);
+			walk_mm(mm, walk);  /* 扫描该 mm 的页表，更新 accessed folio 的 gen */
+	} while (mm);  /* mm=NULL 时退出循环（当前批次已处理完） */
 done:
+	/*
+	 * 只有在完成完整的 mm_list 遍历（success=true）之后，才调用 inc_max_seq()
+	 * 真正推进 max_seq。这保证老化决策基于最新的页表访问信息。
+	 * 若本线程未完成完整遍历（success=false），则不推进 max_seq，
+	 * 留待下一轮调用继续处理剩余 mm。
+	 */
 	if (success) {
+		/* 完整遍历后推进 max_seq；正常情况下 inc_max_seq 必须成功 */
 		success = inc_max_seq(lruvec, seq, can_swap, force_scan);
+		/* inc_max_seq 失败说明逻辑错误（seq 已被他人推进），触发告警 */
 		WARN_ON_ONCE(!success);
 	}
+	/*
+	 * 在推进 max_seq（创建新代）之前，先扫描所有进程的页表 PTE，
+	 * 把 accessed bit 被置位的页面提前从旧 gen 迁移到新代（folio_update_gen(folio, max_seq % MAX_NR_GENS)），
+	 * 这样做可以避免最老gen中那些最近被访问过的页面被误回收
 
+		walk_mm() 扫描 PTE 时发现某页 accessed=1：
+			 ↓
+		folio 原在 gen0（最老）
+			 ↓ folio_update_gen(folio, gen=3)
+		更新folio flags的LRU_GEN(gen=3)
+			 ↓ evict_folios()-->isolate_folios()-->scan_folios()-->sort_folios()移动folio
+		folio 被移到 gen3, 最新链表
+
+		之后回收路扫描gen0：此时这些folio已不在gen0，不会被误回收
+
+	* 这使 "总是回收最老 gen" 的策略变得精确。
+	*/
+
+	/* 返回本线程是否成功完成了一次完整老化（推进了 max_seq） */
 	return success;
 }
 
@@ -5367,6 +5843,9 @@ void lru_gen_soft_reclaim(struct mem_cgroup *memcg, int nid)
  *                          the eviction
  ******************************************************************************/
 
+/*
+ * 进到这里的页面，都是最老一代的页面
+ */
 static bool sort_folio(struct lruvec *lruvec, struct folio *folio, struct scan_control *sc,
 		       int tier_idx)
 {
@@ -5382,6 +5861,7 @@ static bool sort_folio(struct lruvec *lruvec, struct folio *folio, struct scan_c
 	VM_WARN_ON_ONCE_FOLIO(gen >= MAX_NR_GENS, folio);
 
 	/* unevictable */
+	/* unevictable从链表删除，设置PG_unevictable */
 	if (!folio_evictable(folio)) {
 		success = lru_gen_del_folio(lruvec, folio, true);
 		VM_WARN_ON_ONCE_FOLIO(!success, folio);
@@ -5392,15 +5872,29 @@ static bool sort_folio(struct lruvec *lruvec, struct folio *folio, struct scan_c
 	}
 
 	/* promoted */
+	/*
+	 * 如果页面已经不是最老的gen, 说明页面已经被异步提升到最新的gen，则直接将其放入对应的MGLRU链表
+	 * get_nr_to_scan()->try_to_inc_max_seq()->walk_mm()-> ...->folio_update_gen()
+	 */
 	if (gen != lru_gen_from_seq(lrugen->min_seq[type])) {
 		list_move(&folio->lru, &lrugen->folios[gen][type][zone]);
 		return true;
 	}
 
 	/* protected */
+	/*
+	 * tier_idx: 可被驱逐的最大tier, 来自:
+	 *	isolate_folios -> tier_idx = get_tier_idx(lruvec, type)
+	 *		       -> scan_folios(, tier_idx) -> sort_folios(tier_idx)
+	 * 超过tier_idx的页面如果被回收，refault的概率会很高
+	 *
+	 * 如果当前folio的tier大于tier_dix，说明这个folio不可以被驱逐，需要保护
+	 * 或者当前refs已经饱和(4)，也就是tier是最大值了，也需要保护？
+	 */
 	if (tier > tier_idx || refs == BIT(LRU_REFS_WIDTH)) {
 		int hist = lru_hist_from_seq(lrugen->min_seq[type]);
 
+		/* 将页面提升一代，并且加入到对应的MGLRU链表（前面需要拿LRU锁） */
 		gen = folio_inc_gen(lruvec, folio, false);
 		list_move_tail(&folio->lru, &lrugen->folios[gen][type][zone]);
 
@@ -5410,19 +5904,28 @@ static bool sort_folio(struct lruvec *lruvec, struct folio *folio, struct scan_c
 	}
 
 	/* ineligible */
+	/* ineligible：zone 不符合或 PG_lru 已清除 */
 	if (!folio_test_lru(folio) || zone > sc->reclaim_idx) {
+		/* 提升一代，暂缓驱逐 */
 		gen = folio_inc_gen(lruvec, folio, false);
 		list_move_tail(&folio->lru, &lrugen->folios[gen][type][zone]);
 		return true;
 	}
 
 	/* waiting for writeback */
+	/* 正在回写，不能驱逐 */
 	if (folio_test_locked(folio) || folio_test_writeback(folio) ||
 	    (type == LRU_GEN_FILE && folio_test_dirty(folio))) {
 		gen = folio_inc_gen(lruvec, folio, true);
+		/* 注意，这里和上面不同，是移动到头部(较热端) */
 		list_move(&folio->lru, &lrugen->folios[gen][type][zone]);
 		return true;
 	}
+	/*
+	 * 三种情况对应不同的 reclaiming 和 list 位置：
+	 * protection/ineligible: folio_inc_gen(false) + list_move_tail → 加入新代链表尾部（较冷端）
+	 * writeback waiting:     folio_inc_gen(true)  + list_move      → 加入新代链表头部（较热端）
+	 */
 
 	return false;
 }
@@ -5431,7 +5934,7 @@ static bool isolate_folio(struct lruvec *lruvec, struct folio *folio, struct sca
 {
 	bool success;
 
-	/* swap constrained */
+	/* swap constrained(约束) */
 	if (!(sc->gfp_mask & __GFP_IO) &&
 	    (folio_test_dirty(folio) ||
 	     (folio_test_anon(folio) && !folio_test_swapcache(folio))))
@@ -5442,19 +5945,37 @@ static bool isolate_folio(struct lruvec *lruvec, struct folio *folio, struct sca
 		return false;
 
 	/* raced with another isolation */
+	/* 已经被隔离了 */
 	if (!folio_test_clear_lru(folio)) {
 		folio_put(folio);
 		return false;
 	}
 
 	/* see the comment on MAX_NR_TIERS */
+	/*
+        * 若 PG_referenced 未被置位，说明此 folio 近期没有被访问过，
+        * 将 LRU_REFS_MASK（引用计数位域）和 LRU_REFS_FLAGS（辅助标志）一并清零，
+        * 即把 tier 重置为 0。
+        * 原因：folio 即将被发送到 shrink_folio_list() 尝试驱逐，
+        * tier 信息已无意义；清零可确保下次重新加入 LRU 时从 tier 0 起算。
+	*/
 	if (!folio_test_referenced(folio))
 		set_mask_bits(&folio->flags, LRU_REFS_MASK | LRU_REFS_FLAGS, 0);
 
 	/* for shrink_folio_list() */
+        /*
+         * 清除 PG_reclaim：该 bit 在 sort_folio() 对等待回写的 folio 调用
+         * folio_inc_gen(reclaiming=true) 时被置位，表示"正在排队等回写"。
+         * 现在进入正式隔离流程，清除此标志，给 shrink_folio_list() 一个干净状态。
+         */
 	folio_clear_reclaim(folio);
+        /*
+         * 清除 PG_referenced：shrink_folio_list() 依赖此 bit 决定是否保留 folio，
+         * 在隔离时清零，确保判断基于隔离后的新鲜访问记录，而非历史遗留。
+         */
 	folio_clear_referenced(folio);
 
+	/* 将页面从mglru链表中移除 */
 	success = lru_gen_del_folio(lruvec, folio, true);
 	VM_WARN_ON_ONCE_FOLIO(!success, folio);
 
@@ -5480,6 +6001,7 @@ static int scan_folios(struct lruvec *lruvec, struct scan_control *sc,
 	if (get_nr_gens(lruvec, type) == MIN_NR_GENS)
 		return 0;
 
+	/* 取最老的gen */
 	gen = lru_gen_from_seq(lrugen->min_seq[type]);
 
 	for (i = MAX_NR_ZONES; i > 0; i--) {
@@ -5488,6 +6010,11 @@ static int scan_folios(struct lruvec *lruvec, struct scan_control *sc,
 		int zone = (sc->reclaim_idx + i) % MAX_NR_ZONES;
 		struct list_head *head = &lrugen->folios[gen][type][zone];
 
+		/*
+		 * 遍历所有合适的zone
+		 * 对 &lrugen->folios[gen][type][zone]的所有页面调用sort_folio()进行筛选
+		 * 如果合适，则调用isolate_folio()隔离出来，如果隔离失败，则放回原来的链表
+		 */
 		while (!list_empty(head)) {
 			struct folio *folio = lru_to_folio(head);
 			int delta = folio_nr_pages(folio);
@@ -5499,12 +6026,18 @@ static int scan_folios(struct lruvec *lruvec, struct scan_control *sc,
 
 			scanned += delta;
 
+			/*
+			 * 在扫描的时候先判断页面是否可以被隔离回收，如果不可以，则将其动态提升到更新的代
+			 * 如果可以被隔离回收，则进入下面的isolate_folio
+			 */
 			if (sort_folio(lruvec, folio, sc, tier))
 				sorted += delta;
 			else if (isolate_folio(lruvec, folio, sc)) {
+				/* 将页面加入list */
 				list_add(&folio->lru, list);
 				isolated += delta;
 			} else {
+				/* 将跳过的页面从lru链表删除并加入moved链表  */
 				list_move(&folio->lru, &moved);
 				skipped_zone += delta;
 			}
@@ -5514,6 +6047,7 @@ static int scan_folios(struct lruvec *lruvec, struct scan_control *sc,
 		}
 
 		if (skipped_zone) {
+			/* 将跳过的页面重新加到原来的链表 */
 			list_splice(&moved, head);
 			__count_zid_vm_events(PGSCAN_SKIP, zone, skipped_zone);
 			skipped += skipped_zone;
@@ -5539,9 +6073,28 @@ static int scan_folios(struct lruvec *lruvec, struct scan_control *sc,
 	 * There might not be eligible folios due to reclaim_idx. Check the
 	 * remaining to prevent livelock if it's not making progress.
 	 */
+       /*
+        * 返回值语义：
+        * - `isolated || !remaining`（有隔离成果 或 配额耗尽）→ 返回 scanned，
+        *   告知调用者扫描了多少页，用于推进 min_seq 和统计。
+	*
+        * - 否则（两者都不满足：既没隔离到页面，配额也没耗尽）→ 返回 0，
+        *   ** 表示本 type 当前 zone 内没有合适页面（可能全被 sort/skip）**，
+        *   调用者（isolate_folios）将尝试切换到另外一种type。
+        *
+        * NOTE：即使 reclaim_idx 限制导致没有合适 folio，remaining 减少也能防止活锁。
+        */
 	return isolated || !remaining ? scanned : 0;
 }
 
+/*
+ * 获取可以驱逐的最大tier
+ *
+ * 判断条件是从tier1开始，如果tierN的refault率远远大于tier0，认为tierN是不可以被驱逐的
+ * 所以返回上一个tier，也就是tier(N-1)，所以从tier0到tier(N-1)都是可以被驱逐的
+ *
+ * 如果refault率判断条件都不成立，则至二级返回最大的tier，也就是3
+ */
 static int get_tier_idx(struct lruvec *lruvec, int type)
 {
 	int tier;
@@ -5555,10 +6108,21 @@ static int get_tier_idx(struct lruvec *lruvec, int type)
 	read_ctrl_pos(lruvec, type, 0, 1, &sp);
 	for (tier = 1; tier < MAX_NR_TIERS; tier++) {
 		read_ctrl_pos(lruvec, type, tier, 2, &pv);
+		/*
+		 * !(pv * 1 <= sp * 2)
+		 * 当前tier的refault率 高于 tier0 refault率的两倍
+		 * 也就是当前tier的refault率 远高于 tier0的refault率
+		 * 具体看positive_ctrl_err的解释
+		 *
+		 * 条件成立break出去说明tierN的refault率远远大于tier0的refault率
+		 *
+		 * tierN的refault率太高，说明被回收后很快又被访问了，所以这个tier不能被驱逐(代价太高)
+		 */
 		if (!positive_ctrl_err(&sp, &pv))
 			break;
 	}
 
+	/* 返回上一个tier，可以被驱逐的最高tier */
 	return tier - 1;
 }
 
@@ -5597,6 +6161,7 @@ static int isolate_folios(struct lruvec *lruvec, struct scan_control *sc, int sw
 	int type;
 	int scanned;
 	int tier = -1;
+	/* 获取min_seq[LRU_GEN_ANON] 和 min_seq[LRU_GEN_FILE] */
 	DEFINE_MIN_SEQ(lruvec);
 
 	/*
@@ -5606,6 +6171,9 @@ static int isolate_folios(struct lruvec *lruvec, struct scan_control *sc, int sw
 	 *    first.
 	 * 2. If !__GFP_IO, file first since clean pagecache is more likely to
 	 *    exist than clean swapcache.
+	 */
+	/*
+	 * 通过swappiness和min_seq判断应该回收哪一类页面
 	 */
 	if (!swappiness)
 		type = LRU_GEN_FILE;
@@ -5620,10 +6188,21 @@ static int isolate_folios(struct lruvec *lruvec, struct scan_control *sc, int sw
 	else
 		type = get_type_to_scan(lruvec, swappiness, &tier);
 
+	/*
+	 * LRU_GEN_ANON = 0 , LRU_GEN_FILE = 1
+	 * #define ANON_AND_FILE 2
+	 *
+	 * 根据type，从ANON开始遍历: type=FILE，只回收FILE，type=ANON，先回收ANON再回收FILE
+	 */
 	for (i = !swappiness; i < ANON_AND_FILE; i++) {
 		if (tier < 0)
 			tier = get_tier_idx(lruvec, type);
 
+		/*
+		 * 如果没成功隔离页面并且扫描配额用完，
+		 * 说明当前type&zone内没有合适的页面（可能全被sort/skip）
+		 * 尝试切换到另一种type
+		 */
 		scanned = scan_folios(lruvec, sc, type, tier, list);
 		if (scanned)
 			break;
@@ -5657,6 +6236,10 @@ static int evict_folios(struct lruvec *lruvec, struct scan_control *sc, int swap
 
 	scanned = isolate_folios(lruvec, sc, swappiness, &type, &list);
 
+	/*
+	 * 尝试推进最老的gen
+	 * 如果最老gen的页面都被隔离出来了，则可以被推进
+	 */
 	scanned += try_to_inc_min_seq(lruvec, swappiness);
 
 	if (get_nr_gens(lruvec, !swappiness) == MIN_NR_GENS)
@@ -5729,6 +6312,15 @@ retry:
 	return scanned;
 }
 
+/*
+ * 在扫描页面的时候(gen_nr_to_scan)，判断是否需要老化
+ *
+ * 1.gen <= 1，需要老化’
+ * 2.gen == 4，不需要老化；
+ * 3.gen == 3:
+ *	3.1 热页过多（超过1/2），需要老化
+ *	3.2 冷页过少（超过1/4），需要老化
+ */
 static bool should_run_aging(struct lruvec *lruvec, unsigned long max_seq,
 			     bool can_swap, unsigned long *nr_to_scan)
 {
@@ -5740,6 +6332,11 @@ static bool should_run_aging(struct lruvec *lruvec, unsigned long max_seq,
 	DEFINE_MIN_SEQ(lruvec);
 
 	/* whether this lruvec is completely out of cold folios */
+	/*
+	 * MIN_NR_GENS = 2
+	 * 如果当前类型（ANON/FILE）的gen太少，只有一个或两个gen
+	 * 那说明老的页面太少了，必须马上老化
+	 */
 	if (min_seq[!can_swap] + MIN_NR_GENS > max_seq) {
 		*nr_to_scan = 0;
 		return true;
@@ -5756,9 +6353,12 @@ static bool should_run_aging(struct lruvec *lruvec, unsigned long max_seq,
 			for (zone = 0; zone < MAX_NR_ZONES; zone++)
 				size += max(READ_ONCE(lrugen->nr_pages[gen][type][zone]), 0L);
 
+			/* 获取所有gen的总大小 */
 			total += size;
+			/* 获取最新gen的总大小 */
 			if (seq == max_seq)
 				young += size;
+			/* 获取最老gen的总大小, 只有在存在4个gen的情况下才统计 */
 			else if (seq + MIN_NR_GENS == max_seq)
 				old += size;
 		}
@@ -5771,6 +6371,15 @@ static bool should_run_aging(struct lruvec *lruvec, unsigned long max_seq,
 	 * stalls when the number of generations reaches MIN_NR_GENS. Hence, the
 	 * ideal number of generations is MIN_NR_GENS+1.
 	 */
+	/*
+	 * 三个gen是最理想的老化状态
+	 * 如果有4个gen，则不老化
+	 *
+	 * question：这个判断能否提前，这样还不需要走for循环的size计算
+	 * answer: 不行，因为返回后还需要用到nr_to_scan
+	 * 当 gen=4、should_run_aging 返回 false 时，调用者get_nr_to_scan()依然需要通过 nr_to_scan的值
+	 * 知道这个 lruvec 里一共有多少页面可供回收（用于计算本次 eviction 的扫描配额 nr_to_scan >> sc->priority）。
+	 */
 	if (min_seq[!can_swap] + MIN_NR_GENS < max_seq)
 		return false;
 
@@ -5781,8 +6390,11 @@ static bool should_run_aging(struct lruvec *lruvec, unsigned long max_seq,
 	 * aging cares about the upper bound of hot pages, while the eviction
 	 * cares about the lower bound of cold pages.
 	 */
+	/* gen=3 的情况 */
+	/* 如果热页过多(young > total/2)，则需要老化 */
 	if (young * MIN_NR_GENS > total)
 		return true;
+	/* 如果冷页过少(old < total/4)，则需要老化 */
 	if (old * (MIN_NR_GENS + 2) < total)
 		return true;
 
@@ -5791,30 +6403,74 @@ static bool should_run_aging(struct lruvec *lruvec, unsigned long max_seq,
 
 /*
  * For future optimizations:
- * 1. Defer try_to_inc_max_seq() to workqueues to reduce latency for memcg
+ * 1. Defer(延迟) try_to_inc_max_seq() to workqueues to reduce latency for memcg
  *    reclaim.
+ */
+/*
+ * 扫描目标lruvec的MGLRU链表，判断是否需要老化，需需要老化则推进gen
+ *
+ * 返回值：
+ * 返回-1：说明老化成功，刚老化完成，需要让新的gen稳定，告诉调用者以先不回收
+ * 返回 0：说明老化失败，这时候应该没有足够多的冷页来回收，告诉调用者先不回收
+ * 返回>0：说明存在可以回收的页面
  */
 static long get_nr_to_scan(struct lruvec *lruvec, struct scan_control *sc, bool can_swap)
 {
 	bool success;
 	unsigned long nr_to_scan;
+	/* 从lruve中获取对应的memcg */
 	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
+
+	/*
+	 * 定义并获取max_seq
+	 * 相当于unsigned long max_seq = READ_ONCE((lruvec)->lrugen.max_seq)
+	 */
 	DEFINE_MAX_SEQ(lruvec);
 
 	if (mem_cgroup_below_min(sc->target_mem_cgroup, memcg))
 		return -1;
 
+	/*
+	 * 判断是否需要进行页面老化，获取nr_to_scan
+	 */
 	success = should_run_aging(lruvec, max_seq, can_swap, &nr_to_scan);
 
-	/* try to scrape all its memory if this memcg was deleted */
+	/* try to scrape(清除) all its memory if this memcg was deleted */
+	/*
+	 * nr_to_scan不为0，说明gen的个数 >= 3
+	 *
+	 * mem_cgroup_online(memcg) 返回 false，
+	 * 说明这个 memcg 已经被删除（进程退出或 cgroup 被 rmdir），正处于离线/回收状态。
+	 *
+	 * 此时的策略是：不管 aging 是否需要，直接返回全部页面数量，一次性把这个 memcg 的内存全部回收掉。
+	 *
+	 * 返回全量nr_to_scan，而不做>> sc->priority缩放，意味着不限速、全力回收
+	 * nr_to_scan && 是防御性检查，确保memcg确实还有页面
+	 */
 	if (nr_to_scan && !mem_cgroup_online(memcg))
 		return nr_to_scan;
 
 	/* try to get away with not aging at the default priority */
+	/*
+	 * 1. !success，不需要老化，返回扫描配额
+	 * 2. sc->priority == DEF_PRIORITY，回收压力等级是默认值12，也就是回收压力最小，也不需要老化
+	 *
+	 * 注释已说明：在默认优先级下尽量避免 aging 开销
+	 * 这是 lazy aging 的又一层体现：只有在内存压力升高（priority 降低）时才真正去执行 aging。
+	 */
 	if (!success || sc->priority == DEF_PRIORITY)
 		return nr_to_scan >> sc->priority;
 
 	/* stop scanning this lruvec as it's low on cold folios */
+	/*
+	 * 可执行老化的条件：
+	 *	1. success = true（需要 aging）
+	 *	2. 同时sc->priority < DEF_PRIORITY（内存压力已经升高）
+	 *
+	 * 返回值说明：
+	 *	1. -1: aging 成功（max_seq 推进）,告知调用者跳过这个 lruvec 本轮 eviction（刚 aging 完，让新 gen 稳定一下）
+	 *	2.  0: aging 失败（有其他线程已经推进了 max_seq），已经没有页面可以老化了
+	 */
 	return try_to_inc_max_seq(lruvec, max_seq, can_swap, false) ? -1 : 0;
 }
 
@@ -5858,25 +6514,40 @@ static bool try_to_shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
 	while (true) {
 		int delta;
 
+		/* 获取扫描配额 */
 		nr_to_scan = get_nr_to_scan(lruvec, sc, swappiness);
+		/*
+		 * 返回-1：说明老化成功，刚老化完成，需要让新的gen稳定，所以先不回收
+		 * 返回 0：说明老化失败，没有冷页可回收，所以也先不回收
+		 */
 		if (nr_to_scan <= 0)
 			break;
 
+		/* 页面回收核心，返回处理过的页面数 */
 		delta = evict_folios(lruvec, sc, swappiness);
+		/* eviction没有任何进展，退出 */
 		if (!delta)
 			break;
 
 		scanned += delta;
+		/* 如果处理过的页面数量已经等于或者超过扫描配额，则退出 */
 		if (scanned >= nr_to_scan)
 			break;
 
+		/* 判断回收目标是否已经达成，达成则退出 */
 		if (should_abort_scan(lruvec, sc))
 			break;
 
+		/* 主动让出cpu，避免长时间占用 */
 		cond_resched();
 	}
 
 	/* whether this lruvec should be rotated */
+	/*
+	 * 返回值
+	 *	true：最后一次 get_nr_to_scan 返回 -1，说明本次循环是因为触发了 aging 而退出的。调用者据此将这个 lruvec 对应的 memcg 旋转到 "young" 位置（回收完成，给予奖励）。
+	 *	false：正常耗尽扫描配额或无法继续，调用者根据其他条件决定 memcg 的位置。
+	 */
 	return nr_to_scan < 0;
 }
 
@@ -5889,9 +6560,19 @@ static int shrink_one(struct lruvec *lruvec, struct scan_control *sc)
 	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
 
 	/* lru_gen_age_node() called mem_cgroup_calculate_protection() */
+	/*
+	* memcg 当前内存用量低于 memory.min 保护阈值，完全不需要对该memcg进行回收。
+	* 直接返回 MEMCG_LRU_YOUNG，让这个 memcg 在 memcg LRU 中旋转到最年轻的位置，
+	* 使其短期内不再被回收选中。
+	*/
 	if (mem_cgroup_below_min(NULL, memcg))
 		return MEMCG_LRU_YOUNG;
 
+	/*
+	 * memcg 用量低于 memory.low 保护阈值，应尽量不回收。这里有一次缓冲机制：
+	 * - 若 memcg 当前 seg 不是 MEMCG_LRU_TAIL：返回 MEMCG_LRU_TAIL，让其在当前 gen 的尾部等待，给一次额外的机会
+	 * - 若 memcg 已经是 MEMCG_LRU_TAIL（第二次机会也用完了）：无奈允许回收，触发 MEMCG_LOW 事件通知
+	 */
 	if (mem_cgroup_below_low(NULL, memcg)) {
 		/* see the comment on MEMCG_NR_GENS */
 		if (READ_ONCE(lruvec->lrugen.seg) != MEMCG_LRU_TAIL)
@@ -5900,6 +6581,7 @@ static int shrink_one(struct lruvec *lruvec, struct scan_control *sc)
 		memcg_memory_event(memcg, MEMCG_LOW);
 	}
 
+	/* MGLRU页面回收主逻辑 */
 	success = try_to_shrink_lruvec(lruvec, sc);
 
 	shrink_slab(sc->gfp_mask, pgdat->node_id, memcg, sc->priority);
@@ -6652,6 +7334,9 @@ void lru_gen_init_pgdat(struct pglist_data *pgdat)
 	}
 }
 
+/*
+ * MGLRU初始化lruvec
+ */
 void lru_gen_init_lruvec(struct lruvec *lruvec)
 {
 	int i;
@@ -6659,6 +7344,7 @@ void lru_gen_init_lruvec(struct lruvec *lruvec)
 	struct lru_gen_folio *lrugen = &lruvec->lrugen;
 	struct lru_gen_mm_state *mm_state = get_mm_state(lruvec);
 
+	/* max_seq = 3 */
 	lrugen->max_seq = MIN_NR_GENS + 1;
 	lrugen->enabled = lru_gen_enabled();
 
@@ -6995,7 +7681,7 @@ static inline bool should_continue_reclaim(struct pglist_data *pgdat,
 /*
  * 遍历memcg，对每个memcg进行LRU回收和slab回收
  *
- * 1.遍历memcg，如果是kswapd则进行完整遍历, 反正这进行部分遍历;
+ * 1.遍历memcg，如果是kswapd则进行完整遍历, 反之则进行部分遍历;
  * 2.判断当前memcg的内存保护情况，判断是否回收；
  *	- 如果当前memcg内存使用低于min限制，则需要硬保护, 禁止回收，跳过；
  *	- 如果当前memcg内存使用低于low限制，则需要软保护，条件回收；
@@ -7067,7 +7753,7 @@ static void shrink_node_memcgs(pg_data_t *pgdat, struct scan_control *sc)
 		reclaimed = sc->nr_reclaimed;
 		scanned = sc->nr_scanned;
 
-		/* 关键：遍历各类LRU可回收链表，依次回收/老化页面 */
+		/* 关键：遍历LRU各类可回收链表，依次回收/老化页面 */
 		shrink_lruvec(lruvec, sc);
 
 		/* 调用注册的shrinker回收slab内存 */
@@ -7554,7 +8240,7 @@ retry:
 					sc->priority);
 		sc->nr_scanned = 0;
                 /* 核心函数：扫描并回收各个zone的内存 */
-		shrink_zones(zonelist, sc);
+		 shrink_zones(zonelist, sc);
 
 		/* 如果回收到符合需求的内存数量，则退出 */
 		if (sc->nr_reclaimed >= sc->nr_to_reclaim)
@@ -9260,3 +9946,377 @@ void check_move_unevictable_folios(struct folio_batch *fbatch)
 	}
 }
 EXPORT_SYMBOL_GPL(check_move_unevictable_folios);
+
+/*
+ * 传统LRU回收
+  kswapd
+	--> balance_pgdat
+		--> kswapd_age_node
+		--> memcg1_soft_limit_reclaim
+		--> kswapd_shrink_node
+			--> shrink_node
+				--> prepare_scan_control
+				--> shrink_node_memcgs
+					--> shrink_lruvec
+						--> lru_gen_shrink_lruvec
+						--> get_scan_count [only called by shrink_list()]
+						--> shrink_list
+							--> shrink_inactive_list
+								--> isolate_lru_folios
+								--> shrink_folio_list
+									--> folio_check_references
+									--> try_to_unmap
+									--> pageout
+									--> filemap_release_folio
+									--> __remove_mapping
+									--> free_unref_folios
+								--> move_folios_to_lru
+							--> shrink_active_list
+						--> shrink_active_list
+					--> shrink_slab
+
+
+  kswapd_run()                                    [mm/vmscan.c:9161]
+    └─ kthread_run(kswapd, pgdat, ...)
+         └─ kswapd()                              [mm/vmscan.c:9174]
+              │  tsk->flags |= PF_MEMALLOC | PF_KSWAPD
+              │  for (;;) {
+              ├─ kswapd_try_to_sleep()            [mm/vmscan.c:9055]
+              │    ├─ prepare_to_wait()           ← 设置 TASK_INTERRUPTIBLE
+              │    ├─ wake_up_process(kcompactd)  ← 唤醒内存规整线程
+              │    └─ schedule()                  ← 休眠，等待 wakeup_kswapd() 唤醒
+              │
+              ├─ kswapd_age_node
+              │    │
+              │    │ // 传统LRU老化路径
+              │    │ // 如果匿名页不可以老化(没有swap\支持demotion)，或者inactive匿名页还比较多，则不老化
+              │    │ if (!can_age_anon_pages(pgdat, sc))
+              │    │ if (!inactive_is_low(lruvec, LRU_INACTIVE_ANON))
+              │    │	return;
+              │    │
+              │    └─ shrink_active_list(LRU_ACTIVE_ANON)	//传统LRU，从root memcg向下遍历, 这里只老化anon list
+              │
+              └─ balance_pgdat(pgdat, order, highest_zoneidx)  [mm/vmscan.c:8732]
+                   │  sc.priority = DEF_PRIORITY  (初始优先级=12)
+                   │  do {                        ← 优先级递减循环
+                   │
+                   ├─ [可选] memcg1_soft_limit_reclaim()   ← v1 软限制回收
+                   │
+                   ├─ kswapd_shrink_node(pgdat, &sc)        [mm/vmscan.c:8615]
+                   │    │  sc->nr_to_reclaim = Σ max(high_wmark, SWAP_CLUSTER_MAX)
+                   │    └─ shrink_node(pgdat, sc)            [mm/vmscan.c:7476]
+                   │         │
+                   │         │  ← 传统LRU路径（MGLRU未开启 或 非全局回收）
+                   │         ├─ prepare_scan_control()       ← 更新 anon_cost/file_cost 等
+                   │         └─ shrink_node_memcgs(pgdat, sc) [mm/vmscan.c:7381]
+                   │              │  partial=NULL（kswapd 总是完整遍历）
+                   │              │  for each memcg in tree:
+                   │              ├─ mem_cgroup_calculate_protection()
+                   │              ├─ [skip] below_min → continue（硬保护）
+                   │              ├─ [skip] below_low && !low_reclaim → continue（软保护）
+                   │              ├─ shrink_lruvec(lruvec, sc)  [mm/vmscan.c:7137]
+                   │              │    │
+                   │              │    ├─ get_scan_count(lruvec, sc, nr[])
+                   │              │    │    └─ 按 anon/file 比例分配各 LRU 链表扫描数
+                   │              │    │       综合考虑的因素包括：swappiness\sc->priority\memcg的内存限制
+                   │              │    │
+                   │              │    │  blk_start_plug()      ← 合并块设备 I/O
+                   │              │    │  while (nr[INACTIVE_ANON] || nr[ACTIVE_FILE] || nr[INACTIVE_FILE]):
+                   │              │    │    for_each_evictable_lru(lru):  ← 遍历 4 条链表
+                   │              │    │      nr_to_scan = min(nr[lru], SWAP_CLUSTER_MAX)
+                   │              │    │
+                   │              │    ├─ shrink_list(lru, nr_to_scan, lruvec, sc)  [mm/vmscan.c:3030]
+                   │              │    │    ├─ is_active_lru(lru)?
+                   │              │    │    │    └─ shrink_active_list()        // 可能会老化file或者anon list
+                   │              │    │    │         ├─ isolate_lru_folios()       ← 从 active 尾部隔离
+                   │              │    │    │         ├─ folio_check_references()   ← 判断引用热度
+                   │              │    │    │         ├─ → l_active: 重新放回 active（最近访问）
+                   │              │    │    │         └─ → l_inactive: 降级到 inactive 链表头
+                   │              │    │    │
+                   │              │    │    └─ !active:
+                   │              │    │         └─ shrink_inactive_list()         [mm/vmscan.c:2637]
+                   │              │    │              ├─ too_many_isolated()? → reclaim_throttle()
+                   │              │    │              ├─ lru_add_drain()
+                   │              │    │              ├─ isolate_lru_folios()  ← 从 inactive 尾部隔离
+                   │              │    │              ├─ shrink_folio_list(&folio_list, ...)  [mm/vmscan.c:1446]
+                   │              │    │              │    │  逐个处理隔离出的 folio：
+                   │              │    │              │    ├─ folio_trylock()
+                   │              │    │              │    ├─ folio_check_references()        ← 引用检测
+                   │              │    │              │    │    ├─ FOLIOREF_ACTIVATE  → 放回 active
+                   │              │    │              │    │    ├─ FOLIOREF_KEEP      → 放回 inactive
+                   │              │    │              │    │    └─ FOLIOREF_RECLAIM   → 继续回收
+                   │              │    │              │    ├─ [匿名页] add_to_swap()  ← 分配 swap 空间
+                   │              │    │              │    ├─ [mapped] try_to_unmap() ← 解除所有页表映射
+                   │              │    │              │    ├─ [dirty] pageout()    ← 触发回写
+                   │              │    │              │    │    └─ mapping->a_ops->writepage()
+                   │              │    │              │    ├─ [clean] __remove_mapping() ← 从 page cache 删除
+                   │              │    │              │    └─ free_unref_page() / 放入 free_pages list
+                   │              │    │              └─ move_folio_to_lru()   ← 未回收的放回LRU链表
+                   │              │    │
+                   │              │    ├─ blk_finish_plug()
+                   │              │    │
+                   │              │    └─ shrink_active_list()
+                   │              │
+                   │              └─ shrink_slab(gfp, nid, memcg, priority)  ← slab/dentry/inode 回收
+                   │
+                   │  } while (--sc->priority >= 0 && !pgdat_balanced())
+                   │
+                   └─ [balanced] 退出，kswapd 回到 kswapd_try_to_sleep()
+
+  kswapd 唤醒触发点：
+  __alloc_pages()
+    └─ get_page_from_freelist()  ← 快速路径失败（低于 low watermark）
+         └─ wake_all_kswapds()   [mm/page_alloc.c:3995]
+              └─ wakeup_kswapd(zone, order, highest_zoneidx)
+                   └─ wake_up_interruptible(&pgdat->kswapd_wait)
+
+  ---
+  二、直接回收（Direct Reclaim）路径
+
+  __alloc_pages(gfp_mask, order, ...)              [mm/page_alloc.c:4770]
+    ├─ get_page_from_freelist()                    ← 快速路径（低于 min watermark → 失败）
+    └─ __alloc_pages_slowpath(gfp_mask, order, ac) [mm/page_alloc.c:4226]
+         │
+         ├─ wake_all_kswapds()                     ← 顺便唤醒 kswapd
+         ├─ get_page_from_freelist()               ← 放宽水位线再试一次
+         │
+         │  [仍然失败，尝试直接回收]
+         │  if (!can_direct_reclaim) → goto nopage
+         │  if (current->flags & PF_MEMALLOC) → goto nopage  ← 防递归
+         │
+         ├─ __alloc_pages_direct_compact(...)	// 先尝试compaction
+         │
+         │  [compaction仍然失败，开始直接回收]
+         │
+         ├─ __alloc_pages_direct_reclaim(...)	// 直接回收
+         │    │
+         │    ├─ __perform_reclaim(gfp_mask, order, ac)  [mm/page_alloc.c:3936]
+         │    │    │  fs_reclaim_acquire()          ← 防止文件系统递归
+         │    │    │  memalloc_noreclaim_save()
+         │    │    │
+         │    │    └─ try_to_free_pages(zonelist, order, gfp_mask, nodemask)
+         │    │         │                          [mm/vmscan.c:8244]
+         │    │         │  sc = { .nr_to_reclaim = SWAP_CLUSTER_MAX,
+         │    │         │         .priority = DEF_PRIORITY, .may_swap = 1, ... }
+         │    │         │
+         │    │         ├─ throttle_direct_reclaim()  ← 进入 pfmemalloc_wait 等 kswapd 唤醒
+	 │    │         │    └─ 若 kswapd 在追赶则节流，减少直接回收竞争
+         │    │         │
+         │    │         └─ do_try_to_free_pages(zonelist, &sc)  [mm/vmscan.c:7897]
+         │    │              │
+         │    │              │  do {               ← 优先级递减循环（12 → 0）
+         │    │              │    if (priority < DEF_PRIORITY-2) sc->may_writepage = 1
+         │    │              │
+         │    │              └─ shrink_zones(zonelist, sc)       [mm/vmscan.c:7728]
+         │    │                   │  for_each_zone_zonelist():
+         │    │                   │    [skip] !cpuset_zone_allowed → continue
+         │    │                   │    [skip] zone already balanced → continue
+         │    │                   │    [可选] memcg1_soft_limit_reclaim()
+         │    │                   │
+         │    │                   └─ shrink_node(pgdat, sc)       [mm/vmscan.c:7476]
+         │    │                        └─ shrink_node_memcgs()
+         │    │                             └─ shrink_lruvec()
+         │    │                                  └─ ... [同 kswapd 路径，见上]
+         │    └─ get_page_from_freelist()
+         │
+         ├─ __alloc_pages_direct_compact(...)	// 再次尝试compaction
+         │
+         ├─ __alloc_pages_may_oom(...)
+	 │    │
+	 │    ├─ get_page_from_freelist()	//再尝试获取内存，如果还是失败，则走oom
+	 │    └─ out_of_memory()
+	 │        │
+	 │        ├─ select_bad_process		//遍历所有task，选出分数最高的task
+	 │        │   └─ oom_evaluate_task	//遍历所有task
+	 │        │       └─  oom_badness	//内存使用最多的(rss + swapents + pagetables)，得分最高；设置oom_score_adj为-1000ke可以避免被杀
+	 │        └─ oom_kill_process		//杀掉选择的task
+	 │
+	 └─ 如果oom杀掉了进程，则重新尝试分配内存，跳转到前面
+
+ * MGLRU回收流程
+ * kswapd
+ *
+  kswapd()                          [vmscan.c: ~8800]
+    └─ balance_pgdat()              [vmscan.c: ~8358]
+         ├─ kswapd_age_node()       [vmscan.c: ~8008]  ← MGLRU 老化入口
+         │    └─ lru_gen_age_node() [vmscan.c: ~5065]
+         └─ kswapd_shrink_node()    [vmscan.c: ~8241]  ← MGLRU 回收入口
+              └─ shrink_node()      [vmscan.c: ~7102]
+                   └─ lru_gen_shrink_node()  [vmscan.c: ~6015]
+                        ├─ shrink_many()    [vmscan.c: ~5924]  ← 多 memcg 路径
+                        │    └─ shrink_one()
+                        └─ shrink_one()     [vmscan.c: ~5883]  ← 单 memcg 路径
+                             └─ try_to_shrink_lruvec()  [vmscan.c: ~5852]
+                                  ├─ get_nr_to_scan()   [vmscan.c: ~5797]
+                                  │    ├─ should_run_aging()       [vmscan.c: ~5732]
+                                  │    └─ try_to_inc_max_seq()     [vmscan.c: ~4903]
+                                  │         ├─ should_walk_mmu()
+                                  │         ├─ iterate_mm_list()   [vmscan.c: ~3990]
+                                  │         ├─ walk_mm()           [vmscan.c: ~4678]
+                                  │         └─ inc_max_seq()       [vmscan.c: ~4835]
+                                  └─ evict_folios()      [vmscan.c: ~5640]
+                                       ├─ isolate_folios()         [vmscan.c: ~5593]
+                                       │    └─ scan_folios()       [vmscan.c: ~5464]
+                                       │       ├─ sort_folio()       [vmscan.c: ~5386]
+                                       │       │   ├─ lru_gen_del_folio():uevitable [vmscan.c]
+                                       │       │   └─ folio_inc_gen()       [vmscan.c: ~5386]
+                                       │       └─ isolate_folio()       [vmscan.c: ~5464]
+                                       │           └─ lru_gen_del_folio()       [vmscan.c: ~5386]
+                                       ├─ try_to_inc_min_seq()
+                                       ├─ shrink_folio_list()      [外部通用函数]
+                                       └─ move_folios_to_lru()
+
+ kswapd_run()                                    [mm/vmscan.c:9161]
+    └─ kthread_run(kswapd, pgdat, ...)
+         └─ kswapd()                              [mm/vmscan.c:9174]
+              │  tsk->flags |= PF_MEMALLOC | PF_KSWAPD
+              │  for (;;) {
+              ├─ kswapd_try_to_sleep()            [mm/vmscan.c:9055]
+              │    ├─ prepare_to_wait()           ← 设置 TASK_INTERRUPTIBLE
+              │    ├─ wake_up_process(kcompactd)  ← 唤醒内存规整线程
+              │    └─ schedule()                  ← 休眠，等待 wakeup_kswapd() 唤醒
+              │
+              ├─ kswapd_age_node
+              │    │
+              │    │ //MGLRU老化路径
+              │    └─ lru_gen_age_node()
+              │
+              └─ balance_pgdat(pgdat, order, highest_zoneidx)  [mm/vmscan.c:8732]
+                   │  sc.priority = DEF_PRIORITY  (初始优先级=12)
+                   │  do {                        ← 优先级递减循环
+                   │
+                   ├─ [可选] memcg1_soft_limit_reclaim()   ← v1 软限制回收
+                   │
+                   ├─ kswapd_shrink_node(pgdat, &sc)        [mm/vmscan.c:8615]
+                   │    │  sc->nr_to_reclaim = Σ max(high_wmark, SWAP_CLUSTER_MAX)
+                   │    └─ shrink_node(pgdat, sc)            [mm/vmscan.c:7476]
+                   │         │
+                   │         │  ← MGLRU路径（MGLRU开启 且是 全局回收）
+                   │         └─ lru_gen_shrink_node()
+                   │              │
+                   │              ├─ set_mm_walk()
+                   │              ├─ set_initial_priority()
+                   │              ├─ shrink_many()		// 使能MEMCG
+                   │              │    └─ shrink_one()		// 逐个遍历memcg，对memcg lruvec进行老化和回收
+                   │              ├─ shrink_one(&pgdat->__lruvec, sc)	// 没使能MEMCG，使用全局node的lruvec
+		   │              │    │
+		   │              │    │  //memcg内存限制判断，如果低于min，则不需要回收，将其放置到最新的位置（什么位置？）
+		   │              │    │  if (mem_cgroup_below_min(NULL, memcg))
+		   │              │    │      return MEMCG_LRU_YOUNG;
+		   │              │    │
+		   │              │    │  //如果低于low，再判断第二次机会是否用完，用完则继续回收
+	           │              │    │  if (mem_cgroup_below_low(NULL, memcg))
+		   │              │    │	   return MEMCG_LRU_TAIL;  //没用完，则降低放置到尾部位置，提前第二次机会
+		   │              │    │      return MEMCG_LRU_YOUNG;
+		   │              │    │
+                   │              │    ├─ try_to_shrink_lruvec()	// 不断老化和回收，直到满足需求
+		   │              │    │    │
+		   │              │    │    │  ** 页面老化 **
+                   │              │    │    ├─ get_nr_to_scan()
+		   │              │    │    │    │
+		   │              │    │    │    │  判断是否需要老化:
+		   │              │    │    │    │	不需要老化: gen == 4
+		   │              │    │    │    │	需要老化  : gen <= 1
+		   │              │    │    │    │	需要老化  : gen ==3，热液过多或者冷页过少
+                   │              │    │    │    ├─ should_run_aging()
+		   │              │    │    │    │
+                   │              │    │    │    └─ try_to_inc_max_seq()
+                   │              │    │    │         ├─ should_walk_mmu()
+                   │              │    │    │         ├─ iterate_mm_list()
+		   │              │    │    │         │
+		   │              │    │    │         │  ** 遍历memcg下的进程页表, 将asecess bit被置位的folio提升到最新的gen **
+                   │              │    │    │         ├─ walk_mm()
+		   │              │    │    │         │    └─ walk_page_range()
+		   │              │    │    │         │         └─ walk_pud_range()
+		   │              │    │    │         │              └─ walk_pmd_range()
+		   │              │    │    │         │                    ├─ walk_pte_range()
+		   │              │    │    │         │                    │    └─ folio_update_gen()  ← update gen 调用点1，将页面提升到最新的gen
+		   │              │    │    │         │                    │
+		   │              │    │    │         │                    └─ walk_pmd_range_locked()
+		   │              │    │    │         │                         └─ folio_update_gen()  ← update gen 调用点2
+		   │              │    │    │         │
+		   │              │    │    │         │	// 这里 update gen，后面哪里将其放到对应的gen?
+		   │              │    │    │         │ // MGLRU总是回收最老的gen，在哪里体现？上面walk_mm扫描的页面都是最老的gen吗
+		   │              │    │    │         │
+		   │              │    │    │         │	 ** 推进max seq，增加最新的gen **
+                   │              │    │    │         └─ inc_max_seq()
+		   │              │    │    │
+		   │              │    │    │  ** 页面回收 **
+                   │              │    │    └─ evict_folios()
+                   │              │    │         ├─ isolate_folios()
+		   │              │    │         │    │  //通过swappiness和min_seq判断应从哪一类页面开始回收
+                   │              │    │         │    ├─ type = LRU_GEN_FILE or LRU_GEN_ANON
+                   │              │    │         │    ├─ get_tier_idx()		//获取可以被回收的最大tier
+		   │              │    │         │    │
+		   │              │    │         │    │  // 根据type，从ANON开始遍历，
+		   │              │    │         │    │  // type=FILE，只回收FILE，type=ANON，先回收ANON再回收FILE
+                   │              │    │         │    └─ scan_folios(type, tier_idx, list)
+		   │              │    │         │         │
+		   │              │    │         │         ├─ gen = lru_gen_from_seq(lrugen->min_seq[type]);	// 获取最老的gen
+		   │              │    │         │         │
+		   │              │    │         │         │  //遍历所有合适的zone
+		   │              │    │         │         │  //对 &lrugen->folios[gen][type][zone]的所有页面调用sort_folio()进行筛选
+		   │              │    │         │         │  //如果合适，则调用isolate_folio()隔离出来，如果隔离失败，则放回原来的链表
+                   │              │    │         │         ├─ sort_folio(type, tier_idx)
+		   │              │    │         │         │   │
+                   │              │    │         │         │   ├─ lru_gen_del_folio()	// 如果是unevitable页面, 将其从原来的链表删除，然后返回
+		   │              │    │         │         │   │
+		   │              │    │         │         │   │  *** 老化后，在这里真正将页面移动到最新的gen的链表中 ***
+		   │              │    │         │         │   │
+		   │              │    │         │         │   │  //如果页面已经不是最老的gen，说明页面已经被异步提升了，则直接将其放入对应的MGLRU链表
+		   │              │    │         │         │   │  if (gen != lru_gen_from_seq(lrugen->min_seq[type])) {
+                   │              │    │         │         │   ├─ list_move(&folio->lru, &lrugen->folios[gen][type][zone]);
+		   │              │    │         │         │   │
+		   │              │    │         │         │   │
+		   │              │    │         │         │   │  *** workingset页面保护， refault率判断 ***
+		   │              │    │         │         │   │  //如果页面的tier大于tier_idx，或者当前页面的tier是最大的，则需要保护
+		   │              │    │         │         │   │  //将页面提升一代，并加入到对应的链表尾部（较冷端）
+		   │              │    │         │         │   │  if (tier > tier_idx || refs == BIT(LRU_REFS_WIDTH)) {
+                   │              │    │         │         │   ├─ folio_inc_gen()
+                   │              │    │         │         │   ├─ list_move_tail(&folio->lru, &lrugen->folios[gen][type][zone]);
+		   │              │    │         │         │   │
+		   │              │    │         │         │   │  ** 正在回写的页面也需要保护 **
+		   │              │    │         │         │   │  //将页面提升一代，并加入到对应的链表头部（较热端）
+                   │              │    │         │         │   ├─ folio_inc_gen()
+                   │              │    │         │         │   └─list_move_tail(&folio->lru, &lrugen->folios[gen][type][zone]);
+		   │              │    │         │         │
+		   │              │    │         │         │  //页面被sort_folio()筛选通过，则尝试隔离
+                   │              │    │         │         ├─ isolate_folio()
+		   │              │    │         │         │    │  // 先判断能否被隔离（swap约束、被异步隔离过等）
+                   │              │    │         │         │    └─ lru_gen_del_folio()		//如果能被隔离，先将页面从mglru链表移除
+		   │              │    │         │         │
+                   │              │    │         │         ├─ list_add(&folio->lru, list);	//页面可以被隔离，将页面加入list
+                   │              │    │         │         └─ list_splice(&moved, head);	//将不可以被隔离的页面重新加到原来的链表
+		   │              │    │         │						// 所以这里会使得最老gen里面还有页面
+		   │              │    │         │
+		   │              │    │         │  ** 尝试推进min_seq **
+		   │              │    │         │    //如果最老gen在所有zone上都没有页面了，则可以推进，否则不推进
+                   │              │    │         ├─ try_to_inc_min_seq()
+		   │              │    │         │
+		   │              │    │         │  ** 开始回收页面，和传统LRU流程一样 **
+                   │              │    │         ├─ shrink_folio_list()      [外部通用函数]
+                   │              │    │         │    │  逐个处理隔离出的 folio：
+                   │              │    │         │    ├─ folio_trylock()
+                   │              │    │         │    ├─ folio_check_references()        ← 引用检测
+                   │              │    │         │    │    ├─ FOLIOREF_ACTIVATE  → 放回 active
+                   │              │    │         │    │    ├─ FOLIOREF_KEEP      → 放回 inactive
+                   │              │    │         │    │    └─ FOLIOREF_RECLAIM   → 继续回收
+                   │              │    │         │    ├─ [匿名页] add_to_swap()  ← 分配 swap 空间
+                   │              │    │         │    ├─ [mapped] try_to_unmap() ← 解除所有页表映射
+                   │              │    │         │    ├─ [dirty] pageout()    ← 触发回写
+                   │              │    │         │    │    └─ mapping->a_ops->writepage()
+                   │              │    │         │    ├─ [clean] __remove_mapping() ← 从 page cache 删除
+                   │              │    │         │    └─ free_unref_page() / 放入 free_pages list
+                   │              │    │         └─ move_folios_to_lru()
+		   │              │    │
+		   │              │    └─ shrink_slab()
+                   │              │
+                   │              └─ clear_mm_walk()
+                   │
+                   │  } while (--sc->priority >= 0 && !pgdat_balanced())
+                   │
+                   └─ [balanced] 退出，kswapd 回到 kswapd_try_to_sleep()
+
+
+
+ */

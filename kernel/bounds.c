@@ -23,7 +23,9 @@ int main(void)
 #endif
 	DEFINE(SPINLOCK_SIZE, sizeof(spinlock_t));
 #ifdef CONFIG_LRU_GEN
+	/* order_base_2(5) = 3, 3bit */
 	DEFINE(LRU_GEN_WIDTH, order_base_2(MAX_NR_GENS + 1));
+	/* 4 - 2 = 2, 2bit */
 	DEFINE(__LRU_REFS_WIDTH, MAX_NR_TIERS - 2);
 #else
 	DEFINE(LRU_GEN_WIDTH, 0);

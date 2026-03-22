@@ -10,9 +10,11 @@
 int try_charge_memcg(struct mem_cgroup *memcg, gfp_t gfp_mask,
 		     unsigned int nr_pages);
 
+/* memcg usage记账 */
 static inline int try_charge(struct mem_cgroup *memcg, gfp_t gfp_mask,
 			     unsigned int nr_pages)
 {
+	/* 不统计root memcg的usage, root memcg没有使用限制 */
 	if (mem_cgroup_is_root(memcg))
 		return 0;
 

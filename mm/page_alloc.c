@@ -3670,6 +3670,7 @@ __alloc_pages_may_oom(gfp_t gfp_mask, unsigned int order,
 		 * reserves
 		 */
 		if (gfp_mask & __GFP_NOFAIL)
+			/* ALLOC_NO_WATERMARKS: 不需要检查watermarks */
 			page = __alloc_pages_cpuset_fallback(gfp_mask, order,
 					ALLOC_NO_WATERMARKS, ac);
 	}
@@ -4493,6 +4494,7 @@ nopage:
 		 * could deplete whole memory reserves which would just make
 		 * the situation worse.
 		 */
+		/* ALLOC_MIN_RESERVE: 允许使用50%的min watermark内存 */
 		page = __alloc_pages_cpuset_fallback(gfp_mask, order, ALLOC_MIN_RESERVE, ac);
 		if (page)
 			goto got_pg;

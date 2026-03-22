@@ -107,6 +107,10 @@
 #endif
 
 /* see the comment on MAX_NR_TIERS */
+/*
+ * LRU_REFS_WIDTH 实际值 = min(2, 剩余可用 bits)
+ * 在 64 位系统通常就是 2 bits，即 LRU_REFS 字段可表示 0~3 共 4 个值
+ */
 #define LRU_REFS_WIDTH	min(__LRU_REFS_WIDTH, BITS_PER_LONG - NR_PAGEFLAGS - \
 			    ZONES_WIDTH - LRU_GEN_WIDTH - SECTIONS_WIDTH - \
 			    NODES_WIDTH - KASAN_TAG_WIDTH - LAST_CPUPID_WIDTH)

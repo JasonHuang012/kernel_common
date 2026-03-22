@@ -133,6 +133,50 @@ static inline int lru_hist_from_seq(unsigned long seq)
 	return seq % NR_HIST_GENS;
 }
 
+
+/*
+  完整的访问次数 → tier 映射表
+
+  folio->flags 中的状态         folio_lru_refs()  lru_tier_from_refs()   tier
+  ─────────────────────────────────────────────────────────────────────────────
+  PG_ref=0, PG_ws=0, REFS=0   →   0 + 0 = 0    order_base_2(1) = 0  →  tier 0  ← 初始态
+
+  访问 1 次 → 设 PG_referenced
+  PG_ref=1, PG_ws=0, REFS=0   →   0 + 0 = 0    order_base_2(1) = 0  →  tier 0
+
+  访问 2 次 → 设 PG_workingset
+  PG_ref=1, PG_ws=1, REFS=0   →   0 + 1 = 1    order_base_2(2) = 1  →  tier 1
+
+  访问 3 次 → REFS++，REFS=1
+  PG_ref=1, PG_ws=1, REFS=1   →   1 + 1 = 2    order_base_2(3) = 2  →  tier 2
+
+  访问 4 次 → REFS++，REFS=2
+  PG_ref=1, PG_ws=1, REFS=2   →   2 + 1 = 3    order_base_2(4) = 2  →  tier 2
+
+  访问 5 次 → REFS++，REFS=3（达到 LRU_REFS_MASK 最大值，后续饱和）
+  PG_ref=1, PG_ws=1, REFS=3   →   3 + 1 = 4    order_base_2(5) = 3  →  tier 3  ← 最热
+
+  访问 6+ 次 → 饱和，REFS 不再变，tier 维持 3
+
+  MAX_NR_TIERS = 4 的设计依据（注释 mmzone.h:375）：
+  LRU_REFS 字段用 MAX_NR_TIERS - 2 = 2 个 spare bit，再加上 PG_referenced 和 PG_workingset 各贡献一个阶段，共支持 4 个 tier，是传统 active/inactive 分类数量的两倍。
+ */
+
+/*
+ * 根据refs获取tier
+ *	PG_referenced	PG_workginset	folio REFS	folio_lru_refs	     lru_tier_from_refs	        tier
+ *							(workingset + REFS)  (refs + 1)
+ *	0		0		0		0 + 0		     order_base_2(0 + 1)	0 初始态
+ *	1		0		0		0 + 0		     order_base_2(0 + 1)	0 访问1次
+ *	1		1		0		1 + 0		     order_base_2(1 + 1)	1 访问2次
+ *	1		1		1		1 + 1		     order_base_2(2 + 1)	2 访问3次, 开始增加folio REFS
+ *	1		1		2		1 + 2		     order_base_2(3 + 1)	2 访问4次
+ *	1		1		3		1 + 3		     order_base_2(4 + 1)	3 访问5次
+ *
+ *	第五次开始folio REFS饱和了，2个bit，后面再次访问都是一样的
+ *
+ * tier返回值范围：[0, 3]
+ */
 static inline int lru_tier_from_refs(int refs)
 {
 	VM_WARN_ON_ONCE(refs > BIT(LRU_REFS_WIDTH));
@@ -141,6 +185,11 @@ static inline int lru_tier_from_refs(int refs)
 	return order_base_2(refs + 1);
 }
 
+/*
+ * 获取folio的tier refs: folio->flags的LRU_REFS段 + PG_workginset
+ *
+ * refs返回值范围：[0, 4]
+ */
 static inline int folio_lru_refs(struct folio *folio)
 {
 	unsigned long flags = READ_ONCE(folio->flags);
@@ -155,6 +204,15 @@ static inline int folio_lru_refs(struct folio *folio)
 	return ((flags & LRU_REFS_MASK) >> LRU_REFS_PGOFF) + workingset;
 }
 
+/*
+ * 获取folio的gen: folio->flags的LRU_GEN段 - 1
+ * 存gen的时候加1，取得时候就间1
+ *
+ * 如果返回-1, 也就是flags的LRU_GEN为0，表示这个folio不在MGLRU上 (巧妙)
+ *
+ * 设计意图：用 0 作哨兵，区分"gen 0" 和"不在 MGLRU 上"这两种状态，无需额外标志位。
+ * 如果直接存 gen，那 0 既可以表示 gen 0，也可以表示"未挂载"，无法区分。
+ */
 static inline int folio_lru_gen(struct folio *folio)
 {
 	unsigned long flags = READ_ONCE(folio->flags);
@@ -285,7 +343,9 @@ static inline bool lru_gen_del_folio(struct lruvec *lruvec, struct folio *folio,
 	flags = set_mask_bits(&folio->flags, LRU_GEN_MASK, flags);
 	gen = ((flags & LRU_GEN_MASK) >> LRU_GEN_PGOFF) - 1;
 
+	/* 待研究 */
 	lru_gen_update_size(lruvec, folio, gen, -1);
+	/* 从MGLRU list中删除 */
 	list_del(&folio->lru);
 
 	return true;
@@ -316,7 +376,7 @@ static inline bool lru_gen_del_folio(struct lruvec *lruvec, struct folio *folio,
 #endif /* CONFIG_LRU_GEN */
 
 /*
- * 将folio直接接到对应的LRU链表中(这里不是加到cpu缓存)
+ * 将folio直接加到对应的LRU链表中(这里不是加到cpu缓存)
  */
 static __always_inline
 void lruvec_add_folio(struct lruvec *lruvec, struct folio *folio)

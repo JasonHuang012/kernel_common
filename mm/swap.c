@@ -196,6 +196,7 @@ static void folio_batch_move_lru(struct folio_batch *fbatch, move_fn_t move_fn)
 	for (i = 0; i < folio_batch_count(fbatch); i++) {
 		struct folio *folio = fbatch->folios[i];
 
+		/* 拿lru锁，如果已经拿了锁，则不用再上锁 */
 		folio_lruvec_relock_irqsave(folio, &lruvec, &flags);
 		/* 例如lru_add类缓存的处理函数是 lru_add() */
 		move_fn(lruvec, folio);
@@ -428,24 +429,70 @@ static void __lru_cache_activate_folio(struct folio *folio)
 }
 
 #ifdef CONFIG_LRU_GEN
+/*
+ * 根据页面的访问情况来增加refs, 包括三个方面：
+ *	PG_referenced: 1 bit, 0/1
+ *	PG_workingset: 1 bit, 0/1
+ *	folio->flags & LRU_REFS_MASK: 2bit, 0/1/2/3
+ *
+ * 访问次数(refs) → Tier → 含义
+ *   0, 1          →  0  → 低频（首次访问，PG_referenced）
+ *   2, 3          →  1  → 中频（PG_referenced + PG_workingset）
+ *   4~7           →  2  → 高频
+ *   8+            →  3  → 极高频（接近热点数据）
+ *
+ * tier 用于 sort_folio() 中的保护决策：
+ *
+ * - tier > tier_idx → 提升到下一代（保护）
+ * - tier <= tier_idx → 可以驱逐
+ *
+ * tier_idx时通过refaul率计算得出的可以被驱逐的最大tier
+ * 大于tier_idx的页面如果被回收，refault的概率会很大。
+ */
 static void folio_inc_refs(struct folio *folio)
 {
 	unsigned long new_flags, old_flags = READ_ONCE(folio->flags);
 
+	/* Unevictable的页面直接返回，tier无意义 */
 	if (folio_test_unevictable(folio))
 		return;
 
+	/*
+	 * step1: set PG_referenced
+	 * first access, set PG_referenced only
+	 *
+	 * 后续使用folio_lru_refs(folio)获取refs(PG_workingset+REFS)时,  返回0，
+	 * 再用lru_tier_from_refs(refs)获取tier时，返回0
+	 * 也就是这时的tier为0
+	 */
 	if (!folio_test_referenced(folio)) {
 		folio_set_referenced(folio);
 		return;
 	}
 
+	/*
+	 * step2: set PG_workingset
+	 * access twice, PG_referenced has been set, now set PG_workingset
+	 *
+	 * 后续使用folio_lru_refs(folio)获取refs(PG_workingset+REFS)时,  返回1，
+	 * 再用lru_tier_from_refs(refs)获取tier时，返回1
+	 * 也就是这时的tier为0
+	 */
 	if (!folio_test_workingset(folio)) {
 		folio_set_workingset(folio);
 		return;
 	}
 
 	/* see the comment on MAX_NR_TIERS */
+	/*
+	 * step3: increase folio->flags & LRU_REFS_MASK
+	 * access again, PG_referenced & PG_workingset has been set,
+	 * now increase folio->flags & LRU_REFS_MASK
+	 *
+	 * 后续使用folio_lru_refs(folio)获取refs(PG_workingset+REFS)时,  返回2\3\4
+	 * 再用lru_tier_from_refs(refs)获取tier时，返回2\2\3
+	 * 也就是这时的tier为2\2\3
+	 */
 	do {
 		new_flags = old_flags & LRU_REFS_MASK;
 		if (new_flags == LRU_REFS_MASK)
@@ -453,6 +500,11 @@ static void folio_inc_refs(struct folio *folio)
 
 		new_flags += BIT(LRU_REFS_PGOFF);
 		new_flags |= old_flags & ~LRU_REFS_MASK;
+	/*
+	 * 更新folio->flags的REFS段，用来提升tier
+	 * try_cmpxchg无锁原子操作，代价极低，比传统LRU性能提升的一个点
+	 *
+	 */
 	} while (!try_cmpxchg(&folio->flags, &old_flags, new_flags));
 }
 #else
@@ -476,11 +528,20 @@ static void folio_inc_refs(struct folio *folio)
  */
 void folio_mark_accessed(struct folio *folio)
 {
+	/*
+	 * 一种场景，sys read
+	 * filemap_read-->folio_mark_accessed-->folio_inc_refs
+	 */
 	if (lru_gen_enabled()) {
+		/*
+		 * 设置PG_referenced\PG_workingset、增加页面的引用计数
+		 * 用于页面的tier提升
+		 */
 		folio_inc_refs(folio);
 		return;
 	}
 
+	/* 第一次访问，设置PG_referenced */
 	if (!folio_test_referenced(folio)) {
 		folio_set_referenced(folio);
 	} else if (folio_test_unevictable(folio)) {
@@ -497,6 +558,18 @@ void folio_mark_accessed(struct folio *folio)
 		 * LRU on the next drain.
 		 */
 		if (folio_test_lru(folio))
+			/*
+			 * 再次访问，移入active list
+			 * 这里需要拿LRU锁，性能较差
+			 *
+			 * 拿锁流程：
+			 * folio_batch_add_and_move-->__folio_batch_add_and_move-->folio_batch_move_lru-->folio_lruvec_relock_irqsave(folio, &lruvec, &flags)
+			 *
+			 * 而MGLRU在这里不需要移动LRU链表，不需要拿锁，只需要更新folio->flags的refs
+			 * 而且使用try_cmpxchg无锁原子操作，代价极低，性能比较好
+			 * MGLRU最后是在回收页面时才移动LRU链表:
+			 * evict_folios-->isolate_folios-->scan_folios-->sort_folio-->判断folio的LRU_GEN后执行list_move
+			 */
 			folio_activate(folio);
 		else
 			__lru_cache_activate_folio(folio);

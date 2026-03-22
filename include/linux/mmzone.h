@@ -328,7 +328,7 @@ enum lruvec_flags {
 
 /*
  * Evictable pages are divided into multiple generations. The youngest and the
- * oldest generation numbers, max_seq and min_seq, are monotonically increasing.
+ * oldest generation numbers, max_seq and min_seq, are monotonically increasing(单调递增).
  * They form a sliding window of a variable size [MIN_NR_GENS, MAX_NR_GENS]. An
  * offset within MAX_NR_GENS, i.e., gen, indexes the LRU list of the
  * corresponding generation. The gen counter in folio->flags stores gen+1 while
@@ -377,6 +377,7 @@ enum lruvec_flags {
  * accesses through file descriptors. This uses MAX_NR_TIERS-2 spare bits in
  * folio->flags.
  */
+/* 活跃程度的四个级别：tier0 tier1 tier2 tier3, tier3是最活跃的 */
 #define MAX_NR_TIERS		4U
 
 #ifndef __GENERATING_BOUNDS_H
@@ -384,7 +385,12 @@ enum lruvec_flags {
 struct lruvec;
 struct page_vma_mapped_walk;
 
+/*
+ * (BIT(3) - 1)  --> (8 - 1) --> 7 --> 0b111
+ * LRU_GEN_MASK = (0b111 << LRU_GEN_PGOFF)
+ */
 #define LRU_GEN_MASK		((BIT(LRU_GEN_WIDTH) - 1) << LRU_GEN_PGOFF)
+/* LRU_GEN_MASK = (0b11 << LRU_REFS_PGOFF) */
 #define LRU_REFS_MASK		((BIT(LRU_REFS_WIDTH) - 1) << LRU_REFS_PGOFF)
 
 #ifdef CONFIG_LRU_GEN
@@ -425,12 +431,23 @@ enum {
  * can be transiently negative when reset_batch_size() is pending.
  */
 /*
- * 理解MGLRU的关键结构体
+ * MGLRU的关键结构体，挂在lruvec下
  */
 struct lru_gen_folio {
 	/* the aging increments the youngest generation number */
+	/*
+	 * max sequence number, 记录当前MGLRU最新一代的序列号
+	 * ANON和FILE共用
+	 * 初始值是3(lru_gen_init_lruvec)，单调递增、一直增加不回头（arm64 64 bit）
+	 * 在老化时触发递增
+	 */
 	unsigned long max_seq;
 	/* the eviction increments the oldest generation numbers */
+	/*
+	 * min sequence number, 记录当前MGLRU最老一代的序列号
+	 * ANON和FILE各自独立
+	 * 初始值是0，因为没初始化，所以初始值就是默认值0，也是单调递增
+	 */
 	unsigned long min_seq[ANON_AND_FILE];
 	/* the birth time of each generation in jiffies */
 	unsigned long timestamps[MAX_NR_GENS];
@@ -457,6 +474,21 @@ struct lru_gen_folio {
 	struct hlist_nulls_node list;
 };
 
+/*
+	seq 和 gen
+	真正决定"年龄"/新老的是seq(max_seq&min_seq)，gen只是MGLRU链表数组的下标，这个数组是可以循环复用的，gen[0]可以存放最老一代，经过回收、老化后，gen[0]也会存放最新的一代，其它gen[]也是一个道理。
+	而max_seq被定义为最老一代的序列号，min_seq是最新一代的序列号，根据max_seq和min_seq能算出所有gen的新老程度，
+	再拿到MGLRU链表中的folio->flags LRU_GEN，就能知道这个MGLRU链表是哪个gen的，也就知道这个MGLRU链表是属于什么新老程度的gen了。
+
+	比如 max_seq = 8-->对应的gen = 8%4 = 0， min_seq = 5-->对应的gen = 5%4 = 1
+		min_seq			max_seq
+	seq:	5	6	7	8
+	gen:	1	2	3	0
+		最新			最老
+
+	明天看看回收和老化，MGLRU链表是怎么操作的
+ */
+
 enum {
 	MM_LEAF_TOTAL,		/* total leaf entries */
 	MM_LEAF_YOUNG,		/* young leaf entries */
@@ -469,7 +501,7 @@ enum {
 #define NR_BLOOM_FILTERS	2
 
 struct lru_gen_mm_state {
-	/* synced with max_seq after each iteration */
+	/* synced with max_seq after each iteration(迭代) */
 	unsigned long seq;
 	/* where the current iteration continues after */
 	struct list_head *head;
@@ -614,6 +646,7 @@ static inline void lru_gen_soft_reclaim(struct mem_cgroup *memcg, int nid)
  * 所有才有了zone-lru，现在系统64位居多，不存在ZONE_HIGH，所以都改用node-lru。
  *
  * 现在LRU链表是挂载node下面的，也就是每个pg_data_t(node)都有一个lruvec
+ * 一个lruvec管理一个node
  */
 struct lruvec {
 	struct list_head		lists[NR_LRU_LISTS]; // LRU链表
@@ -1088,6 +1121,15 @@ static inline bool zone_is_empty(struct zone *zone)
  * sets it, so none of the operations on it need to be atomic.
  */
 
+/*
+  folio->flags（64位，从高到低）：
+
+   63          ...                                                                         0
+   ┌──────────┬────────┬───────┬─────────────┬──────────┬──────────┬───────────┬───────────┐
+   │ SECTIONS │  NODE  │  ZONE │ LAST_CPUPID │  KASAN   │ LRU_GEN  │ LRU_REFS  │ PAGE_FLAGS│
+   │  width   │  width │ width │    width    │  width   │  3 bits  │  2 bits   │           │
+   └──────────┴────────┴───────┴─────────────┴──────────┴──────────┴───────────┴───────────┘
+ */
 /* Page flags: | [SECTION] | [NODE] | ZONE | [LAST_CPUPID] | ... | FLAGS | */
 #define SECTIONS_PGOFF		((sizeof(unsigned long)*8) - SECTIONS_WIDTH)
 #define NODES_PGOFF		(SECTIONS_PGOFF - NODES_WIDTH)

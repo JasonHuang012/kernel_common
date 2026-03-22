@@ -90,6 +90,13 @@ void lruvec_init(struct lruvec *lruvec)
 	 */
 	list_del(&lruvec->lists[LRU_UNEVICTABLE]);
 
+	/*
+	 * 这里是不是要加一个CONFIG_LRU_GEN隔开？
+	 *
+	 * 可能是因为MGLRU是可以动态开关的, /sys/kernel/mm/lru_gen/enabled
+	 * 所以放在这里初始化了?
+	 * 不对啊，配置没开，代码都没编译，动态开关也没用?
+	 */
 	lru_gen_init_lruvec(lruvec);
 }
 
