@@ -12,7 +12,9 @@
  * on the blocked task's kernel stack:
  */
 struct mutex_waiter {
+	/* 挂入mutex->wait_list等待链表 */
 	struct list_head	list;
+	/* 等待者的task_struct */
 	struct task_struct	*task;
 	struct ww_acquire_ctx	*ww_ctx;
 #ifdef CONFIG_DEBUG_MUTEXES

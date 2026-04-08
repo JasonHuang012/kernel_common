@@ -71,27 +71,47 @@ EXPORT_SYMBOL(remove_wait_queue);
  * started to run but is not in state TASK_RUNNING. try_to_wake_up() returns
  * zero in this (rare) case, and we handle it by continuing to scan the queue.
  */
+/*
+ * 函数作用：遍历等待队列，依次调用指定个数的waiter 的回调函数完成唤醒
+ * 参数：
+ *   @wq_head:      等待队列头
+ *   @mode:         唤醒的任务状态掩码（TASK_INTERRUPTIBLE / TASK_UNINTERRUPTIBLE）
+ *   @nr_exclusive: 最多唤醒多少个 exclusive waiter（0 表示全部唤醒, 1表示只唤醒一个）
+ *   @wake_flags:   传给 try_to_wake_up 的标志（如 WF_SYNC）
+ *   @key:          透传给 func 的附加参数（如 poll 事件掩码）
+ * 返回值：剩余未唤醒的 exclusive 配额
+ */
 static int __wake_up_common(struct wait_queue_head *wq_head, unsigned int mode,
 			int nr_exclusive, int wake_flags, void *key)
 {
 	wait_queue_entry_t *curr, *next;
 
+	/* 必须持锁调用，lockdep 检查 */
 	lockdep_assert_held(&wq_head->lock);
 
+	/* 获取等待链表的第一个成员 */
 	curr = list_first_entry(&wq_head->head, wait_queue_entry_t, entry);
 
+	/* 如果等待队列为空，直接退出 */
 	if (&curr->entry == &wq_head->head)
 		return nr_exclusive;
 
+	/* 安全遍历（允许回调中删除当前节点） */
 	list_for_each_entry_safe_from(curr, next, &wq_head->head, entry) {
 		unsigned flags = curr->flags;
 		int ret;
 
+		/* 调用该 waiter 自定义的唤醒函数（默认 default_wake_function → try_to_wake_up） */
 		ret = curr->func(curr, mode, wake_flags, key);
 		if (ret < 0)
 			break;
+		/*
+		 * 成功唤醒一个 exclusive waiter，消耗配额；配额耗尽则停止
+		 * 如果nr_exclusive传入0，!-nr_exclusive 永远为false
+		 */
 		if (ret && (flags & WQ_FLAG_EXCLUSIVE) && !--nr_exclusive)
 			break;
+		/* 非 exclusive waiter 唤醒后继续遍历（thundering herd 的根源） */
 	}
 
 	return nr_exclusive;
@@ -231,6 +251,10 @@ void __wake_up_pollfree(struct wait_queue_head *wq_head)
  */
 /*
  * 将当前进程加入等待队里，设置指定的等待状态，为后续的睡眠等待做准备
+ *
+ *   @wq_head:  等待队列头
+ *   @wq_entry: 调用方在栈上分配的等待节点
+ *   @state:    目标睡眠状态（TASK_INTERRUPTIBLE 等）
  */
 void
 prepare_to_wait(struct wait_queue_head *wq_head, struct wait_queue_entry *wq_entry, int state)
@@ -361,6 +385,7 @@ EXPORT_SYMBOL(do_wait_intr_irq);
  * the wait descriptor from the given waitqueue if still
  * queued.
  */
+/* 函数作用：等待结束后的清理（恢复 RUNNING 状态，从队列移除）*/
 void finish_wait(struct wait_queue_head *wq_head, struct wait_queue_entry *wq_entry)
 {
 	unsigned long flags;

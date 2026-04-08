@@ -24,7 +24,15 @@
  * DECLARE_COMPLETION_ONSTACK().
  */
 struct completion {
+	/* 计数器：0=未完成，>0=已完成次数，UINT_MAX=complete_all标记 */
 	unsigned int done;
+	/*
+	 * 等待队列头，使用 simple waitqueue（比 waitqueue 更轻量）
+
+	 * 为什么用 swait_queue 而非普通 wait_queue？
+	 * swait（simple wait queue）专为"同一时刻只有少量 waiter"的场景设计，去掉了 wait_queue 的 flags/func 回调机制，锁开销更小。
+	 * completion 的语义天然符合这个假设。
+	 */
 	struct swait_queue_head wait;
 };
 

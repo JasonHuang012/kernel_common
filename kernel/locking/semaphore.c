@@ -211,28 +211,47 @@ static inline int __sched ___down_common(struct semaphore *sem, long state,
 {
 	struct semaphore_waiter waiter;
 
+	/* 将自己放在等待链表的尾部 */
 	list_add_tail(&waiter.list, &sem->wait_list);
+	/* 初始化task为当前进程 */
 	waiter.task = current;
+	/* 初始化up */
 	waiter.up = false;
 
 	for (;;) {
+		/* 检查是否有信号待处理（仅 INTERRUPTIBLE/KILLABLE 状态下有效） */
 		if (signal_pending_state(state, current))
 			goto interrupted;
+		/* 超时检查（仅 down_timeout 路径） */
 		if (unlikely(timeout <= 0))
 			goto timed_out;
+		/* 设置进程状态：UNINTERRUPTIBLE / INTERRUPTIBLE / KILLABLE */
 		__set_current_state(state);
+		/* 释放 sem->lock，让 up() 可以并发运行，然后让出 CPU 睡眠 */
 		raw_spin_unlock_irq(&sem->lock);
+		/*
+		 * 睡眠，直到超时或被 wake_up_process() 唤醒
+		 * 返回值是剩余超时时间（jiffies）
+		 */
 		timeout = schedule_timeout(timeout);
+		/* 被唤醒，重新持锁 */
 		raw_spin_lock_irq(&sem->lock);
+		/*
+		 * 检查 up() 是否已将资源给了自己
+		 * 如果是，直接返回0
+		 */
 		if (waiter.up)
 			return 0;
+		/* 否则是虚假唤醒（spurious wakeup）或信号/超时，继续循环 */
 	}
 
  timed_out:
+	/* 超时处理，不再等待 */
 	list_del(&waiter.list);
 	return -ETIME;
 
  interrupted:
+	/* 被信号中断处理，不再等待 */
 	list_del(&waiter.list);
 	return -EINTR;
 }
@@ -269,11 +288,25 @@ static noinline int __sched __down_timeout(struct semaphore *sem, long timeout)
 	return __down_common(sem, TASK_UNINTERRUPTIBLE, timeout);
 }
 
+/*
+ * 唤醒等待链表的第一个等待者，并将信号量资源给它
+ *
+ * 为什么只是设置up，并唤醒等待者，而不对sem->count进行加1呢？
+ *
+ *
+ * 如果 up() 先 count++ 再唤醒 W1，那么在 W1 被调度到之前的窗口期，
+ * 有新来的 down() 调用者可能抢先拿走这个资源（count 又变 0），
+ * 但 W1 已经被唤醒了，它醒来后会发现"没有资源"，需要重新等待。
+ */
 static noinline void __sched __up(struct semaphore *sem)
 {
+	/* 取出等待链表的第一个等待者 */
 	struct semaphore_waiter *waiter = list_first_entry(&sem->wait_list,
 						struct semaphore_waiter, list);
+	/* 将其从等待链表中删除 */
 	list_del(&waiter->list);
+	/* 设置等待者的up为true，定向将信号量资源给它 */
 	waiter->up = true;
+	/* 唤醒这个等待者 */
 	wake_up_process(waiter->task);
 }

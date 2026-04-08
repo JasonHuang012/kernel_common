@@ -108,6 +108,10 @@ static __always_inline void queued_spin_lock(struct qspinlock *lock)
 {
 	int val = 0;
 
+	/*
+	 * CAS: 期望 val==0（无人持锁），成功则写入 1（_Q_LOCKED_VAL）
+	 * 失败说明有竞争，进入 slowpath
+	 */
 	if (likely(atomic_try_cmpxchg_acquire(&lock->val, &val, _Q_LOCKED_VAL)))
 		return;
 
@@ -124,6 +128,17 @@ static __always_inline void queued_spin_unlock(struct qspinlock *lock)
 {
 	/*
 	 * unlock() needs release semantics:
+	 */
+	/*
+	 * release 语义的字节写：lock->locked = 0
+	 * arm64 展开为 stlrb wzr, [lock]
+	 * release 语义保证临界区所有写对外可见后才执行此 store
+	 * 同时 stlrb 触发 exclusive monitor event，唤醒 WFE 等待者
+	 */
+
+	/*
+	 * release 语义写 0 到 locked 字节
+	 * 这一个 store 就是等待线程 自旋条件 !VAL 的触发源
 	 */
 	smp_store_release(&lock->locked, 0);
 }

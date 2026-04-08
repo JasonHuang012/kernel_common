@@ -310,6 +310,11 @@ static __always_inline u32  __pv_wait_head_or_lock(struct qspinlock *lock,
  * contended             :    (*,x,y) +--> (*,0,0) ---> (*,0,1) -'  :
  *   queue               :         ^--'                             :
  */
+/*
+ * 两个路径：
+ *	分支一：pending 位路径（只有一个等待者）
+ *	分支二：MCS 队列路径（多个等待者）
+ */
 void __lockfunc queued_spin_lock_slowpath(struct qspinlock *lock, u32 val)
 {
 	struct mcs_spinlock *prev, *next, *node;
@@ -347,6 +352,10 @@ void __lockfunc queued_spin_lock_slowpath(struct qspinlock *lock, u32 val)
 	 *
 	 * 0,0,* -> 0,1,* -> 0,0,1 pending, trylock
 	 */
+	/*
+	 * 原子地设置 pending 位，同时读回旧值
+	 * 状态变化：(0,0,1) -> (0,1,1)
+	 */
 	val = queued_fetch_set_pending_acquire(lock);
 
 	/*
@@ -376,13 +385,23 @@ void __lockfunc queued_spin_lock_slowpath(struct qspinlock *lock, u32 val)
 	 * clear_pending_set_locked() implementations imply full
 	 * barriers.
 	 */
+
+	/*
+	 * 线程 B 在此自旋，等待 lock->locked 变为 0
+	 * 判断条件：!VAL，即 locked 字节 == 0
+	 */
 	if (val & _Q_LOCKED_MASK)
-		smp_cond_load_acquire(&lock->locked, !VAL);
+		smp_cond_load_acquire(&lock->locked, !VAL);	// 自旋点
 
 	/*
 	 * take ownership and clear the pending bit.
 	 *
 	 * 0,1,0 -> 0,0,1
+	 */
+
+	/*
+	 * 线程 A unlock 后，线程 B 退出自旋，原子地清 pending、置 locked
+	 * 状态变化：(0,1,0) -> (0,0,1)
 	 */
 	clear_pending_set_locked(lock);
 	lockevent_inc(lock_pending);
@@ -395,6 +414,11 @@ void __lockfunc queued_spin_lock_slowpath(struct qspinlock *lock, u32 val)
 queue:
 	lockevent_inc(lock_slowpath);
 pv_queue:
+
+	/*
+	 * 分支二：MCS 队列路径（多个等待者）
+	 * 当已有 pending 位或 tail 时，线程 C（第三个及以后的竞争者）进入 MCS 队列：
+	 */
 	node = this_cpu_ptr(&qnodes[0].mcs);
 	idx = node->count++;
 	tail = encode_tail(smp_processor_id(), idx);

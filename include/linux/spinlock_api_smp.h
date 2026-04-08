@@ -103,12 +103,19 @@ static inline int __raw_spin_trylock(raw_spinlock_t *lock)
 
 static inline unsigned long __raw_spin_lock_irqsave(raw_spinlock_t *lock)
 {
+	/* 保存 CPSR/EFLAGS 中的中断使能位 */
 	unsigned long flags;
 
+	/* 关闭本地 CPU 硬中断，并将当前中断状态保存到 flags */
 	local_irq_save(flags);
+	/* 禁止内核抢占，防止被更高优先级任务抢走 CPU */
 	preempt_disable();
+	/* lockdep：记录锁的获取，用于死锁检测 */
 	spin_acquire(&lock->dep_map, 0, 0, _RET_IP_);
+	/* 实际自旋获取锁：先 trylock，失败则进入 do_raw_spin_lock 自旋等待 */
 	LOCK_CONTENDED(lock, do_raw_spin_trylock, do_raw_spin_lock);
+
+	/* 返回保存的中断状态，调用者必须用 irqrestore 恢复 */
 	return flags;
 }
 
@@ -122,8 +129,11 @@ static inline void __raw_spin_lock_irq(raw_spinlock_t *lock)
 
 static inline void __raw_spin_lock_bh(raw_spinlock_t *lock)
 {
+	/* 关闭抢占、且禁止软中断 */
 	__local_bh_disable_ip(_RET_IP_, SOFTIRQ_LOCK_OFFSET);
+	/* 增加锁调试信息 */
 	spin_acquire(&lock->dep_map, 0, 0, _RET_IP_);
+	/* 实际自旋获取锁：先 trylock，失败则进入 do_raw_spin_lock 自旋等待 */
 	LOCK_CONTENDED(lock, do_raw_spin_trylock, do_raw_spin_lock);
 }
 

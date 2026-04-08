@@ -11,6 +11,15 @@
 
 #include <linux/types.h>
 
+/* arm64使用qspinlock */
+/* arch/arm64/Kconfig:	select ARCH_USE_QUEUED_SPINLOCKS */
+/*
+ * qspinlock是一个32bit的原子整数，布局如下:
+   31                            16 15        8 7          0
+   |                                | pending   | locked   |
+   |  tail                          | locked_pending       |
+   |  val                                                  |
+ */
 typedef struct qspinlock {
 	union {
 		atomic_t val;
@@ -22,7 +31,12 @@ typedef struct qspinlock {
 		 */
 #ifdef __LITTLE_ENDIAN
 		struct {
-			u8	locked;
+			u8	locked;		// 0: unlocked，1: locked
+			/*
+			 * 有线程在自旋等待,
+			 * 1表示有thread正自旋在spinlock上（确切的说是自旋在locked这个域），
+			 * 0表示没有pending thread。
+			 */
 			u8	pending;
 		};
 		struct {

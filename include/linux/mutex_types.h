@@ -39,13 +39,25 @@
  *   locks and tasks (and only those tasks)
  */
 struct mutex {
-	/* 三种用途记录*/
+	/*
+	 * owner = 持锁者 task_struct 指针 + 低 3 位 flag
+	 * task_struct 指针在 64 位系统上至少 8 字节对齐，低 3 位恒为 0，可以复用：
+	 *
+		bit 63..3   task_struct 指针（持锁者）
+		bit 2       MUTEX_FLAG_PICKUP  (0x04)  handoff 已完成，等待接收方确认
+		bit 1       MUTEX_FLAG_HANDOFF (0x02)  解锁时需定向交给第一个等待者
+		bit 0       MUTEX_FLAG_WAITERS (0x01)  wait_list 非空，解锁时需唤醒
+
+	 * owner == 0 表示锁空闲且无等待者。
+	 */
 	atomic_long_t		owner;
+	/* 保护wait_list的自旋锁 */
 	raw_spinlock_t		wait_lock;
 #ifdef CONFIG_MUTEX_SPIN_ON_OWNER
-	/* 乐观自旋 */
+	/* 乐观自旋队列 */
 	struct optimistic_spin_queue osq; /* Spinner MCS lock */
 #endif
+	/* 锁等待者链表 */
 	struct list_head	wait_list;
 #ifdef CONFIG_DEBUG_MUTEXES
 	void			*magic;
