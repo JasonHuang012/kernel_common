@@ -128,7 +128,7 @@ static inline struct task_struct *__mutex_trylock_common(struct mutex *lock, boo
 		/*
 		 * owner的task不为空，说明锁已经被持有了
 		 * 可能是还没释放
-		 * 也可能是锁还没释放，但是有等待者触发了HANDOFF，已经PICKOUT指定给了自己
+		 * 也可能是锁还没释放，但是有等待者触发了HANDOFF，已经PICKOUT指定给了特定线程
 		 */
 		if (task) {
 			if (flags & MUTEX_FLAG_PICKUP) {

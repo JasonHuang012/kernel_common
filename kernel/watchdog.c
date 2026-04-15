@@ -691,7 +691,7 @@ static enum hrtimer_restart watchdog_timer_fn(struct hrtimer *hrtimer)
 	if (completion_done(this_cpu_ptr(&softlockup_completion))) {
 		reinit_completion(this_cpu_ptr(&softlockup_completion));
 		/*
-		 * 在当前cpu上用stop调度类（task优先级最高）运行softlockup_fn()
+		 * 在**当前cpu上**用**stop调度类**（task优先级最高）运行softlockup_fn()
 		 * hrtimer中断是每个cpu都绑定了一个，所以每个cpu都会运行
 		 */
 		stop_one_cpu_nowait(smp_processor_id(),
