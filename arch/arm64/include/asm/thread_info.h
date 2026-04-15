@@ -42,7 +42,7 @@ struct thread_info {
 	void			*scs_base;
 	void			*scs_sp;
 #endif
-	u32			cpu;
+	u32			cpu;	// 线程当前运行的
 };
 
 #define thread_saved_pc(tsk)	\

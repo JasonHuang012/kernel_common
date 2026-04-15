@@ -12,11 +12,17 @@ struct page_counter {
 	 * Make sure 'usage' does not share cacheline with any other field. The
 	 * memcg->memory.usage is a hot member of struct mem_cgroup.
 	 */
+	/*
+	 * 当前使用量（页面个数）
+	 * 由于是热数据，所以让其独占一个cacheline
+	 */
 	atomic_long_t usage;
-	CACHELINE_PADDING(_pad1_);
+	CACHELINE_PADDING(_pad1_);	// 确保usage独占一个cacheline
 
 	/* effective memory.min and memory.min usage tracking */
+	/* effective min（继承父节点计算后的实际保护值）*/
 	unsigned long emin;
+	/* min保护范围内的实际使用量 */
 	atomic_long_t min_usage;
 	atomic_long_t children_min_usage;
 
@@ -34,10 +40,15 @@ struct page_counter {
 	CACHELINE_PADDING(_pad2_);
 
 	bool protection_support;
+	/* memory.min 配置值（硬保护）*/
 	unsigned long min;
+	/* memory.low 配置值（软保护）*/
 	unsigned long low;
+	/* memory.high 配置值（软限制）*/
 	unsigned long high;
+	/* memory.max 配置值（硬限制）*/
 	unsigned long max;
+	/* 父节点，构成树形层次 */
 	struct page_counter *parent;
 } ____cacheline_internodealigned_in_smp;
 

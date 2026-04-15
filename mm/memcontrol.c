@@ -2365,7 +2365,11 @@ retry:
 	 * a forward progress or bypass the charge if the oom killer
 	 * couldn't make any progress.
 	 */
-	/* 判断 8：OOM kill */
+	/*
+	 * 判断 8：OOM kill
+	 * 只在该 memcg 的任务范围内选受害者（不影响 memcg 外的进程）
+	 * 选评分最高（内存占用最大 + oom_score_adj 最高）的任务
+	 */
 	if (mem_cgroup_oom(mem_over_limit, gfp_mask,
 			   get_order(nr_pages * PAGE_SIZE))) {
 		passed_oom = true;

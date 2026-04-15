@@ -452,6 +452,9 @@ struct lru_gen_folio {
 	/* the birth time of each generation in jiffies */
 	unsigned long timestamps[MAX_NR_GENS];
 	/* the multi-gen LRU lists, lazily sorted on eviction */
+	/*
+	 * MGLRU链表三维数组
+	 */
 	struct list_head folios[MAX_NR_GENS][ANON_AND_FILE][MAX_NR_ZONES];
 	/* the multi-gen LRU sizes, eventually consistent */
 	long nr_pages[MAX_NR_GENS][ANON_AND_FILE][MAX_NR_ZONES];
@@ -467,10 +470,16 @@ struct lru_gen_folio {
 	/* whether the multi-gen LRU is enabled */
 	bool enabled;
 	/* the memcg generation this lru_gen_folio belongs to */
+	/* 当前memcg属于哪个memcg代，0/1/2，这个代可能是old也可能是young, memcg fifo链表数组的下标 */
 	u8 gen;
 	/* the list segment this lru_gen_folio belongs to */
+	/* 当前memcg属于memcg fifo链表中的位置， MEMCG_LRU_HEAD/MEMCG_LRU_TAIL/0 */
 	u8 seg;
 	/* per-node lru_gen_folio list for global reclaim */
+	/*
+	 * 挂入到memcg的fifo链表头对应的链表中
+	 * sturct pglist_data --> sturct lru_gen_memcg --> fifo
+	 */
 	struct hlist_nulls_node list;
 };
 
@@ -533,7 +542,7 @@ struct lru_gen_mm_walk {
 /*
  * For each node, memcgs are divided into two generations: the old and the
  * young. For each generation, memcgs are randomly sharded into multiple bins
- * to improve scalability. For each bin, the hlist_nulls is virtually divided
+ * to improve scalability(可拓展性). For each bin, the hlist_nulls is virtually divided
  * into three segments: the head, the tail and the default.
  *
  * An onlining memcg is added to the tail of a random bin in the old generation.
@@ -572,15 +581,99 @@ struct lru_gen_mm_walk {
  *    MEMCG_NR_GENS is set to three so that when reading the generation counter
  *    locklessly, a stale value (seq-1) does not wraparound to young.
  */
+/*
+  在启用 MGLRU + memcg 的系统上，全局回收面临同样的问题——如何从 node 上众多 memcg 中高效、有优先级地选出下一个回收目标。lru_gen_memcg 正是为此设计的替代方案，解决了传统 mem_cgroup_iter() 无优先级、扩展性差的问题。
+
+  传统方案（mem_cgroup_iter()）是遍历整棵 cgroup 树，效率低且锁竞争严重。
+  lru_gen_memcg 实现了一套专为全局回收设计的 memcg 选择机制，本质上是：对 memcg 本身建立一个两代 LRU（类似 MGLRU 对 page 的做法），通过 LRU 语义决定优先回收哪个 memcg，具体如下：
+
+  维度1：分代（old / young）
+	memcg 被分成两代：old 是待回收队列，young 是"暂时免回收"队列。回收只扫描 old 代，young 代短期内不会被选中。这与 MGLRU 对 page 的处理逻辑完全类似。
+
+  维度2：随机分 bin（MEMCG_NR_BINS = 8）
+	每代再随机分成 8 个 bin，每次操作选一个随机 bin。这是为了可扩展性：避免全局串行扫描，多个 kswapd/direct reclaim 线程可以并行从不同 bin 回收不同 memcg，减少锁竞争。
+
+  lru_gen_rotate_memcg() 实现以下四种 memcg 位置调整：
+
+  ┌─────────────────┬─────────────────────────┬──────────┬───────────┐
+  │      操作       │        目标位置         │ gen 变化 │ seg 变化  │
+  ├─────────────────┼─────────────────────────┼──────────┼───────────┤
+  │ MEMCG_LRU_HEAD  │ 当前代的随机 bin 头部   │ 不变     │ → HEAD    │
+  ├─────────────────┼─────────────────────────┼──────────┼───────────┤
+  │ MEMCG_LRU_TAIL  │ 当前代的随机 bin 尾部   │ 不变     │ → TAIL    │
+  ├─────────────────┼─────────────────────────┼──────────┼───────────┤
+  │ MEMCG_LRU_OLD   │ old 代的随机 bin 头部   │ → old    │ → default │
+  ├─────────────────┼─────────────────────────┼──────────┼───────────┤
+  │ MEMCG_LRU_YOUNG │ young 代的随机 bin 尾部 │ → young  │ → default │
+  └─────────────────┴─────────────────────────┴──────────┴───────────┘
+
+  shrink_many() 从 old 代的某个 bin 头部开始扫描，因此在头部的 memcg 最先被回收。这就是 HEAD/TAIL/OLD/YOUNG 操作影响回收优先级的方式。
+
+  七个触发事件的设计意图：
+
+  注释中列出了触发四种操作的七个事件，背后都有明确的策略意图：
+
+  事件 1：超过 soft limit（memory.high）     → MEMCG_LRU_HEAD（头部，优先回收）
+  事件 2：首次回收 memcg 低于 low 阈值      → MEMCG_LRU_TAIL（本代尾部，给一次缓冲）
+  事件 3：首次回收 offlined 或太小的 memcg  → MEMCG_LRU_TAIL（同上）
+  事件 4：二次回收 offlined 或太小的 memcg  → MEMCG_LRU_YOUNG（移入 young，彻底放过）
+  事件 5：回收 memcg 低于 min 阈值          → MEMCG_LRU_YOUNG（受保护，跳过）
+  事件 6：eviction 路径完成 aging           → MEMCG_LRU_YOUNG（刚被充分回收，暂缓）
+  事件 7：memcg offline                     → MEMCG_LRU_OLD（移入 old，尽快清理）
+
+  可以看出这套机制将 memcg 的保护语义（min/low/high）映射到了 memcg LRU 的位置上：
+
+  memory.min 保护    →  直接 YOUNG（完全免回收）
+  memory.low 保护    →  先 TAIL（缓冲一次），再允许但触发 LOW 事件
+  memory.high 超限   →  HEAD（最高优先级回收）
+  正常回收完成       →  YOUNG（获得喘息机会）
+
+  lru_gen_memcg 的本质是把 MGLRU 的分代淘汰思想应用到了 memcg 选择层面：
+
+  ┌────────────────────────────┬──────────────┬───────────────────────────┬────────────────────────────┐
+  │            层面            │   分代对象   │       代际推进条件        │          回收目标          │
+  ├────────────────────────────┼──────────────┼───────────────────────────┼────────────────────────────┤
+  │ MGLRU（lru_gen_folio）     │ page / folio │ 老化（aging）推进 max_seq │ min_seq 所在代的 page      │
+  ├────────────────────────────┼──────────────┼───────────────────────────┼────────────────────────────┤
+  │ memcg LRU（lru_gen_memcg） │ memcg        │ old 代全部回收完后 seq++  │ old 代中优先级最高的 memcg │
+  └────────────────────────────┴──────────────┴───────────────────────────┴────────────────────────────┘
+
+  两者配合，形成了一个完整的层次化 LRU：先在 memcg 维度选出优先回收哪个 cgroup，再在 page 维度选出该 cgroup 中优先回收哪些 page。同时通过 8 个随机 bin 打散热点，使得多核并行回收时不会全部串在同一条链表上。
+
+
+
+*/
+
 #define MEMCG_NR_GENS	3
 #define MEMCG_NR_BINS	8
 
+/* struct pglist_data --> struct lru_gen_memcg */
 struct lru_gen_memcg {
 	/* the per-node memcg generation counter */
+	/* memcg的gen计数器，永远表示old代，young代为seq+1 */
 	unsigned long seq;
 	/* each memcg has one lru_gen_folio per node */
+	/*
+	 * struct mem_cgroup
+	 *	-->struct mem_cgroup_per_node
+	 *		--> struct lruvec
+	 *			--> struct lru_gen_folio {
+	 *				max_seq
+	 *				min_seq
+	 *				MGLRU 链表三维数组
+	 *				struct hlist_nulls_node list;	// 挂入到fifo链表中
+	 *			    }
+	 */
+	/* old和young代链表中的memcg成员的总数量 */
 	unsigned long nr_memcgs[MEMCG_NR_GENS];
 	/* per-node lru_gen_folio list for global reclaim */
+	/*
+	 * fifo链表头数组：
+	 *	1.二维数组，3 × 8的空间， 链表头数组, 注意存放的是链表头!
+	 *	2.数组的的每个成员是memcg链表的链表头；
+	 *	3.只有old和young两代，所以最多只有16个数组成员
+	 *	4.old和young是通过seq一直向前推进的，bin是随机值，随机存储；
+	 */
 	struct hlist_nulls_head	fifo[MEMCG_NR_GENS][MEMCG_NR_BINS];
 	/* protects the above */
 	spinlock_t lock;

@@ -6,6 +6,15 @@
 #include <linux/const.h>
 
 /*
+ * 普通链表用 NULL 表示结束，nulls 链表用一个编码了额外信息的奇数指针表示结束：
+ * 初始化时，每个 fifo[i][j] 的 nulls 标记编码了 i（gen 值）：
+	 // mm/vmscan.c:7336
+	  INIT_HLIST_NULLS_HEAD(&pgdat->memcg_lru.fifo[i][j], i);
+	 // 即 fifo[i][j].first = NULLS_MARKER(i)
+	 // 空链表时，first 指针本身就是 nulls，且编码了 gen=i
+ */
+
+/*
  * Special version of lists, where end of list is not a NULL pointer,
  * but a 'nulls' marker, which can have many different values.
  * (up to 2^31 different values guaranteed on all platforms)

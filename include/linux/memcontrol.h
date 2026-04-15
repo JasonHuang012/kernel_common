@@ -86,6 +86,7 @@ struct mem_cgroup_reclaim_iter {
  */
 struct mem_cgroup_per_node {
 	/* Keep the read-only fields at the start */
+	/* 反向指针，指向所在的mem_cgroup */
 	struct mem_cgroup	*memcg;		/* Back pointer, we cannot */
 						/* use container_of	   */
 
@@ -109,9 +110,15 @@ struct mem_cgroup_per_node {
 #endif
 
 	/* Fields which get updated often at the end. */
+	/*
+	 * memcg在当前NUMA node的lruvec
+	 * 内存回收经常要用到，数据热数据，也让其独占一条cacheline
+	 */
 	struct lruvec		lruvec;
 	CACHELINE_PADDING(_pad2_);
+	/* 每个zone的LRU大小 */
 	unsigned long		lru_zone_size[MAX_NR_ZONES][NR_LRU_LISTS];
+	/* 内存回收轮询游标，防止反复回收同一个memcg */
 	struct mem_cgroup_reclaim_iter	iter;
 };
 
@@ -181,17 +188,20 @@ struct obj_cgroup {
  * to help the administrator determine what knobs to tune.
  */
 struct mem_cgroup {
+	/* cgroup框架的接入点，引用计数，待研究 */
 	struct cgroup_subsys_state css;
 
 	/* Private memcg ID. Used to ID objects that outlive the cgroup */
 	struct mem_cgroup_id id;
 
 	/* Accounted resources */
+	/* ── 记账层 ── */
+	/* 跟踪rss + pagecache */
 	struct page_counter memory;		/* Both v1 & v2 */
 
 	union {
-		struct page_counter swap;	/* v2 only */
-		struct page_counter memsw;	/* v1 only */
+		struct page_counter swap;	/* v2 only, 单独的swap记账 */
+		struct page_counter memsw;	/* v1 only, mem+swap记账 */
 	};
 
 	/* registered local peak watchers */
@@ -200,6 +210,7 @@ struct mem_cgroup {
 	spinlock_t	 peaks_lock;
 
 	/* Range enforcement for interrupt charges */
+	/* memory.high 超限时的异步回收工作 */
 	struct work_struct high_work;
 
 #ifdef CONFIG_ZSWAP
@@ -213,13 +224,16 @@ struct mem_cgroup {
 #endif
 
 	/* vmpressure notifications */
+	/* 内存压力统计，供PSI使用 */
 	struct vmpressure vmpressure;
 
 	/*
 	 * Should the OOM killer kill all belonging tasks, had it kill one?
 	 */
+	/* oom是是否杀掉整个group的所有任务 */
 	bool oom_group;
 
+	/* 当前cgroup的swappiness */
 	int swappiness;
 
 	/* memory.events and memory.events.local */
@@ -230,9 +244,11 @@ struct mem_cgroup {
 	struct cgroup_file swap_events_file;
 
 	/* memory.stat */
+	/* 内存统计汇总 */
 	struct memcg_vmstats	*vmstats;
 
 	/* memory.events */
+	/* low/high/max/oom 事件计数 */
 	atomic_long_t		memory_events[MEMCG_NR_MEMORY_EVENTS];
 	atomic_long_t		memory_events_local[MEMCG_NR_MEMORY_EVENTS];
 
@@ -254,6 +270,7 @@ struct mem_cgroup {
 	/* list of inherited objcgs, protected by objcg_lock */
 	struct list_head objcg_list;
 
+	/* per-CPU热统计 */
 	struct memcg_vmstats_percpu __percpu *vmstats_percpu;
 
 #ifdef CONFIG_CGROUP_WRITEBACK
@@ -323,6 +340,12 @@ struct mem_cgroup {
 	spinlock_t event_list_lock;
 #endif /* CONFIG_MEMCG_V1 */
 
+	/*
+	 * per-node LRU
+	 * mem cgroup在每个node上都有yige mem_cgoup_per_node结构体
+	 * 这个结构体包含一个独立的lruvec
+	 * 也就是memcg在不同nod上都有一个独立的lruvec，主要用于内存回收
+	 */
 	struct mem_cgroup_per_node *nodeinfo[];
 };
 

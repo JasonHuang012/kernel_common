@@ -2832,7 +2832,7 @@ static unsigned long shrink_inactive_list(unsigned long nr_to_scan,
  * 从LRU active链表中取出合适的页面加入inactive链表
  *
  * 1.**isolate_lru_folios()**，从LRU active链表隔离出指定数量的页面；
- * 2.逐个编译folio
+ * 2.逐个遍历folio
 	- 如果是unevictable页面，则直接加入LRU unevictable链表；
 	- 如果是引用计数为0且可执行的文件页面，则还是返回active链表；
 	- 将下面类型的页面加入inactive链表，需要清除PG_active
@@ -3362,6 +3362,8 @@ static void get_scan_count(struct lruvec *lruvec, struct scan_control *sc,
 	 * 3.sc->priority为0表示达到最大扫描力度了，说明系统内存很紧张了，
 	 *   这时需要等量扫描匿名页和文件页，尽快释放内存。
 	 *   除非当前memcg不支持swap
+	 *
+	 * 扫描优先级达到0，说明前面一直没回收到内存、内存相当紧张了，开始回收匿名页
 	 */
 	if (!sc->priority && swappiness) {
 		scan_balance = SCAN_EQUAL;
@@ -3662,6 +3664,9 @@ static bool should_clear_pmd_young(void)
 #define get_memcg_gen(seq)	((seq) % MEMCG_NR_GENS)
 #define get_memcg_bin(bin)	((bin) % MEMCG_NR_BINS)
 
+/*
+ * 获取memcg在特定NUMA node上的lruvec
+ */
 static struct lruvec *get_lruvec(struct mem_cgroup *memcg, int nid)
 {
 	struct pglist_data *pgdat = NODE_DATA(nid);
@@ -5718,6 +5723,9 @@ enum {
 	MEMCG_LRU_YOUNG,
 };
 
+/*
+ * MGLRU memcg划分为old\young两代的关键
+ */
 static void lru_gen_rotate_memcg(struct lruvec *lruvec, int op)
 {
 	int seg;
@@ -5730,10 +5738,27 @@ static void lru_gen_rotate_memcg(struct lruvec *lruvec, int op)
 
 	VM_WARN_ON_ONCE(hlist_nulls_unhashed(&lruvec->lrugen.list));
 
+	/*
+	 * seg初始值为0
+	 * 设置new初始值为old
+	 */
 	seg = 0;
 	new = old = lruvec->lrugen.gen;
 
 	/* see the comment on MEMCG_NR_GENS */
+	/*
+	 ┌─────────────────┬─────────────────────────┬──────────┬───────────┐
+	 │      操作       │        目标位置         │ gen 变化 │ seg 变化  │
+	 ├─────────────────┼─────────────────────────┼──────────┼───────────┤
+	 │ MEMCG_LRU_HEAD  │ 当前代的随机 bin 头部   │ 不变     │ → HEAD    │
+	 ├─────────────────┼─────────────────────────┼──────────┼───────────┤
+	 │ MEMCG_LRU_TAIL  │ 当前代的随机 bin 尾部   │ 不变     │ → TAIL    │
+	 ├─────────────────┼─────────────────────────┼──────────┼───────────┤
+	 │ MEMCG_LRU_OLD   │ old 代的随机 bin 头部   │ → old    │ → default │
+	 ├─────────────────┼─────────────────────────┼──────────┼───────────┤
+	 │ MEMCG_LRU_YOUNG │ young 代的随机 bin 尾部 │ → young  │ → default │
+	 └─────────────────┴─────────────────────────┴──────────┴───────────┘
+	 */
 	if (op == MEMCG_LRU_HEAD)
 		seg = MEMCG_LRU_HEAD;
 	else if (op == MEMCG_LRU_TAIL)
@@ -5748,8 +5773,10 @@ static void lru_gen_rotate_memcg(struct lruvec *lruvec, int op)
 	WRITE_ONCE(lruvec->lrugen.seg, seg);
 	WRITE_ONCE(lruvec->lrugen.gen, new);
 
+	/* 先将当前memcg从原来的链表中删除 */
 	hlist_nulls_del_rcu(&lruvec->lrugen.list);
 
+	/* 根据op要求，将memcg放入新的链表位置 */
 	if (op == MEMCG_LRU_HEAD || op == MEMCG_LRU_OLD)
 		hlist_nulls_add_head_rcu(&lruvec->lrugen.list, &pgdat->memcg_lru.fifo[new][bin]);
 	else
@@ -5758,6 +5785,11 @@ static void lru_gen_rotate_memcg(struct lruvec *lruvec, int op)
 	pgdat->memcg_lru.nr_memcgs[old]--;
 	pgdat->memcg_lru.nr_memcgs[new]++;
 
+	/*
+	 * 关键！！
+	 * 只有等old代为空时，再向前推进memcg_lru.seq，这样就能保证永远最多只有两个代：old和young
+	 * 推进后，以前的young代变为old，新上线的memcg或者rotote的memcg挂到新的young代中
+	 */
 	if (!pgdat->memcg_lru.nr_memcgs[old] && old == get_memcg_gen(pgdat->memcg_lru.seq))
 		WRITE_ONCE(pgdat->memcg_lru.seq, pgdat->memcg_lru.seq + 1);
 
@@ -5766,12 +5798,79 @@ static void lru_gen_rotate_memcg(struct lruvec *lruvec, int op)
 
 #ifdef CONFIG_MEMCG
 
+/*
+ * 用户态: mkdir /sys/fs/cgroup/foo
+            │
+            ▼
+    cgroup_mkdir()                           [kernel/cgroup/cgroup.c]
+      └── css_create()
+            └── mem_cgroup_css_alloc()       ← 第一步：分配与初始化
+                  └── mem_cgroup_alloc(parent)
+                        ├─ kzalloc(struct_size(memcg, nodeinfo, nr_node_ids))
+                        │     按节点数动态分配，nodeinfo[] 柔性数组
+                        │
+                        ├─ xa_alloc(&mem_cgroup_ids, &memcg->id.id, ...)
+                        │     分配全局唯一 ID（1 ~ MEM_CGROUP_ID_MAX = 65535）
+                        │
+                        ├─ kzalloc(memcg_vmstats)          统计汇总结构
+                        ├─ alloc_percpu(vmstats_percpu)    per-CPU 热统计
+                        │     → 建立 statc->parent 链（指向父 memcg 的 percpu 统计）
+                        │       用于 rstat 层次折叠
+                        │
+                        ├─ for_each_node: alloc_mem_cgroup_per_node_info()
+                        │     每个 NUMA node 分配 mem_cgroup_per_node：
+                        │       ├─ alloc_percpu(lruvec_stats_percpu)
+                        │       └─ lruvec 本身嵌入其中（无需单独分配）
+                        │
+                        ├─ memcg_wb_domain_init()           writeback domain
+                        ├─ INIT_WORK(&high_work, high_work_func)
+                        ├─ vmpressure_init(&vmpressure)
+                        └─ lru_gen_init_memcg(memcg)
+                              └─ INIT_LIST_HEAD(&mm_list->fifo)
+                                 spin_lock_init(&mm_list->lock)
+                                 （MGLRU 的 mm_struct 扫描队列初始化）
+
+                  page_counter_init(&memcg->memory, &parent->memory, true)
+                      └─ counter->parent = &parent->memory
+                         counter->max = PAGE_COUNTER_MAX   ← 初始无限制
+                         （memory/swap/kmem 各建一棵向上指的计数树）
+
+            └── mem_cgroup_css_online()      ← 第二步：发布使其可见
+                  ├─ memcg_online_kmem()          分配 kmemcg_id，激活 slab 计量
+                  ├─ alloc_shrinker_info()        分配 per-memcg shrinker bitmap
+                  ├─ lru_gen_online_memcg()       ← MGLRU 关键步骤
+                  │     for_each_node:
+                  │       gen = get_memcg_gen(pgdat->memcg_lru.seq)
+                  │       hlist_nulls_add_tail_rcu(&lruvec->lrugen.list,
+                  │           &pgdat->memcg_lru.fifo[gen][bin])
+                  │       pgdat->memcg_lru.nr_memcgs[gen]++
+                  │     → 将新 memcg 的 lruvec 插入全局 memcg LRU 轮转队列
+                  │       回收路径通过此队列轮询所有 memcg
+                  │
+                  ├─ refcount_set(&memcg->id.ref, 1)
+                  ├─ css_get(css)                 id 持有一个 css 引用
+                  └─ xa_store(&mem_cgroup_ids, id, memcg)
+                         → 发布到 xarray，mem_cgroup_from_id() 从此可用
+
+
+ * 用户态创建memcg时，最后将memcg上线
+ *	css_create
+	  --> mem_cgroup_alloc
+	  --> mem_cgroup_css_online
+	      --> lru_gen_onlien_memcg
+
+ */
 void lru_gen_online_memcg(struct mem_cgroup *memcg)
 {
 	int gen;
 	int nid;
+	/* 随机选择一个bin，0-7之间 */
 	int bin = get_random_u32_below(MEMCG_NR_BINS);
 
+	/*
+	 * 遍历所有NUMA node, 将node对应的memcg挂入相应的链表
+	 * 有多少个NUMA node就有多少个memcg
+	 */
 	for_each_node(nid) {
 		struct pglist_data *pgdat = NODE_DATA(nid);
 		struct lruvec *lruvec = get_lruvec(memcg, nid);
@@ -5780,17 +5879,43 @@ void lru_gen_online_memcg(struct mem_cgroup *memcg)
 
 		VM_WARN_ON_ONCE(!hlist_nulls_unhashed(&lruvec->lrugen.list));
 
+		/* 获取memcg数组的old代 */
 		gen = get_memcg_gen(pgdat->memcg_lru.seq);
 
 		lruvec->lrugen.gen = gen;
 
+		/* 将当前memcg挂入 old代的第bin条链表的尾部 */
 		hlist_nulls_add_tail_rcu(&lruvec->lrugen.list, &pgdat->memcg_lru.fifo[gen][bin]);
+		/* 统计old代的memcg计数 */
 		pgdat->memcg_lru.nr_memcgs[gen]++;
 
 		spin_unlock_irq(&pgdat->memcg_lru.lock);
 	}
 }
 
+/*
+ * 用户移除memcg时，对memcg进行下线
+ *
+  rmdir /sys/fs/cgroup/foo
+    │
+    ├─ css_offline()          ← 异步，引用归零前调用
+    │     ├─ page_counter_set_min/low = 0    清除保护，避免阻止全局回收
+    │     ├─ drain_all_stock()               回收所有 CPU stock，计数归精确值
+    │     ├─ lru_gen_offline_memcg()         将 lruvec 标记为 OLD 代，加速回收
+    │     ├─ wb_memcg_offline()              解除 writeback domain
+    │     └─ mem_cgroup_id_put()             释放 id 引用
+    │
+    ├─ css_released()                        lruvec 回收迭代器失效
+    │     └─ mem_cgroup_css_released
+    │        └─ lru_gen_release_memcg
+    └─ css_free()                            引用为 0 时调用
+          ├─ lru_gen_exit_memcg()            释放 bloom filter 位图
+          ├─ free_percpu(vmstats_percpu)
+          ├─ kfree(vmstats)
+          ├─ for_each_node: free_mem_cgroup_per_node_info()
+          └─ kfree(memcg)
+
+ */
 void lru_gen_offline_memcg(struct mem_cgroup *memcg)
 {
 	int nid;
@@ -5798,6 +5923,9 @@ void lru_gen_offline_memcg(struct mem_cgroup *memcg)
 	for_each_node(nid) {
 		struct lruvec *lruvec = get_lruvec(memcg, nid);
 
+		/*
+		 * 将memcg挂入到memcg old代链表的头部，后面会优先回收
+		 */
 		lru_gen_rotate_memcg(lruvec, MEMCG_LRU_OLD);
 	}
 }
@@ -5818,6 +5946,7 @@ void lru_gen_release_memcg(struct mem_cgroup *memcg)
 
 		gen = lruvec->lrugen.gen;
 
+		/* 从链表中删除 */
 		hlist_nulls_del_init_rcu(&lruvec->lrugen.list);
 		pgdat->memcg_lru.nr_memcgs[gen]--;
 
@@ -6126,6 +6255,7 @@ static int get_tier_idx(struct lruvec *lruvec, int type)
 	return tier - 1;
 }
 
+/* 待分析 */
 static int get_type_to_scan(struct lruvec *lruvec, int swappiness, int *tier_idx)
 {
 	int type, tier;
@@ -6603,6 +6733,19 @@ static int shrink_one(struct lruvec *lruvec, struct scan_control *sc)
 	       MEMCG_LRU_TAIL : MEMCG_LRU_YOUNG;
 }
 
+/*
+ * shrink_many - 全局回收路径下对多个 memcg 进行页面回收
+ *
+ * 参数：
+ *   @pgdat: 当前 NUMA node 的数据结构，包含 memcg_lru（memcg 的两代 FIFO）
+ *   @sc:    回收控制参数（目标回收量、优先级、gfp 等）
+ *
+ * 返回值：无
+ *
+ * 调用场景：lru_gen_shrink_node() 在启用 memcg 时调用本函数，
+ * 替代传统的 mem_cgroup_iter() 树遍历，以 memcg LRU 的方式
+ * 有优先级地选取 memcg 进行回收。
+ */
 static void shrink_many(struct pglist_data *pgdat, struct scan_control *sc)
 {
 	int op;
@@ -6621,7 +6764,18 @@ restart:
 	memcg = NULL;
 
 	rcu_read_lock();
-
+	/*
+         * 遍历 fifo[gen][bin]链表头所对应的链表的所有 lrugen 节点。
+         *
+         * hlist_nulls_for_each_entry_rcu 展开逻辑：
+         *   pos  = rcu_dereference(fifo[gen][bin].first)   // 取链表头
+         *   while (!is_a_nulls(pos)):                       // 遇到 nulls 标记则停止
+         *       lrugen = container_of(pos, lru_gen_folio, list)
+         *       pos    = rcu_dereference(pos->next)         // 步进到下一个节点
+         *
+         * 循环结束后 pos 指向 nulls 标记指针（编码了 gen 值），
+         * 或者因 break 退出时 pos 指向某个普通节点。
+         */
 	hlist_nulls_for_each_entry_rcu(lrugen, pos, &pgdat->memcg_lru.fifo[gen][bin], list) {
 		if (op) {
 			lru_gen_rotate_memcg(lruvec, op);
@@ -6637,6 +6791,15 @@ restart:
 		lruvec = container_of(lrugen, struct lruvec, lrugen);
 		memcg = lruvec_memcg(lruvec);
 
+		/*
+                 * 尝试获取 memcg 的引用计数（tryget 不会阻塞）：
+                 *   如果 memcg 正在 offline（引用计数已降为 0），tryget 返回 false。
+                 *   此时调用 lru_gen_release_memcg() 将其从 fifo 链表中摘除，
+                 *   并跳过本次回收。
+                 *
+                 * 持有引用计数的目的：防止在 rcu_read_unlock() 之后、
+                 * shrink_one() 执行期间 memcg 被释放。
+                 */
 		if (!mem_cgroup_tryget(memcg)) {
 			lru_gen_release_memcg(memcg);
 			memcg = NULL;
@@ -6645,10 +6808,28 @@ restart:
 
 		rcu_read_unlock();
 
+		/*
+                 * 对当前 memcg 的 lruvec 执行实际的页面回收：
+                 *   - 检查 memory.min/low 保护，决定是否跳过或缓冲；
+                 *   - 调用 try_to_shrink_lruvec() 执行 MGLRU 页面回收；
+                 *   - 调用 shrink_slab() 回收 slab 对象；
+                 *   - 返回值是该 memcg 下一步应执行的 rotate 操作：
+                 *       MEMCG_LRU_YOUNG：回收成功或受保护，移入 young 代
+                 *       MEMCG_LRU_TAIL ：给一次缓冲机会，移到当前代尾部
+                 *       0              ：继续留在 old 代当前位置
+                 *
+                 * 返回值存入 op，在下一轮循环开头（或循环结束后）执行 rotate。
+                 */
 		op = shrink_one(lruvec, sc);
 
 		rcu_read_lock();
 
+                /*
+                 * 检查是否应该提前终止本次全局回收：
+                 *   - 已回收页面数达到目标（nr_reclaimed >= nr_to_reclaim）；
+                 *   - kswapd 场景下所有 zone 水位已恢复到 WMARK_HIGH 以上。
+                 * 满足条件则 break，pos 此时指向某个普通节点（非 nulls）。
+                 */
 		if (should_abort_scan(lruvec, sc))
 			break;
 	}
@@ -6660,14 +6841,43 @@ restart:
 
 	mem_cgroup_put(memcg);
 
+        /*
+         * 判断循环退出原因：
+         *   - 若 pos 不是 nulls 标记（is_a_nulls 为 false），说明是被
+         *     should_abort_scan() 触发 break 提前退出的，回收目标已达成，
+         *     直接返回，不再遍历其他 bin。
+         *   - 若 pos 是 nulls 标记，说明当前 bin 正常遍历完毕，
+         *     继续后续的 restart 检测和 bin 轮转逻辑。
+         */
 	if (!is_a_nulls(pos))
 		return;
 
 	/* restart if raced with lru_gen_rotate_memcg() */
+	/*
+	 * nulls 标记竞态检测（restart 判断）：
+	 *
+	 *   fifo[i][j] 初始化时：INIT_HLIST_NULLS_HEAD(&fifo[i][j], i)
+	 *   即 fifo[i][j].first = NULLS_MARKER(i)，nulls 标记编码了 gen=i。
+	 *
+	 *   正常情况：遍历 fifo[gen][bin] 到链表尾，pos = NULLS_MARKER(gen)，
+	 *   get_nulls_value(pos) == gen，检测通过。
+	 *
+	 *   异常情况：遍历过程中某个节点被 lru_gen_rotate_memcg() 从
+	 *   fifo[gen][bin_A] 移到 fifo[other_gen][bin_B]，遍历的 next 指针
+	 *   跟着跑到了 fifo[other_gen][bin_B] 的链表尾，读到的 nulls 值是
+	 *   other_gen 而不是 gen，说明本次遍历可能漏掉了部分 memcg，
+	 *   需要 goto restart 重新从当前 bin 开始遍历。
+	 */
 	if (gen != get_nulls_value(pos))
 		goto restart;
 
 	/* try the rest of the bins of the current generation */
+        /*
+         * 当前 bin 遍历完毕且无竞态，轮转到下一个 bin：
+         *   get_memcg_bin(bin+1) = (bin+1) % MEMCG_NR_BINS
+         *   若还没转完一圈（bin != first_bin），goto restart 继续遍历下一个 bin；
+         *   若已转完一圈（bin == first_bin），退出函数，本次全局回收结束。
+         */
 	bin = get_memcg_bin(bin + 1);
 	if (bin != first_bin)
 		goto restart;
@@ -7444,7 +7654,7 @@ static void lru_gen_shrink_node(struct pglist_data *pgdat, struct scan_control *
  *	- 设置每次扫描的最大数量为32（SWAP_CLUSTER_MAX）;
  *	- 如果设置了proportional_reclaim, 一直回收，直到页面全部扫描完后，直接退出；
  *	- 如果kswapd或者memcg局部回收等, 达成回收木匾后，根据剩余扫描量重新调整扫描量，直到数量扫描完成后退出；
- * 5.如果inactive页面数量较少，调用**shrink_inactive_list**，再次平衡匿名链表的active/inactive比例；
+ * 5.如果inactive页面数量较少，调用**shrink_active_list**，再次平衡匿名链表的active/inactive比例；
  */
 static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
 {
@@ -7708,7 +7918,7 @@ static void shrink_node_memcgs(pg_data_t *pgdat, struct scan_control *sc)
 	 * For kswapd, reliable forward progress is more important
 	 * than a quick return to idle. Always do full walks.
 	 */
-	/* 直接回收可以进行memcg部分遍历, kswapd总是进行完整遍历? */
+	/* 直接回收进行memcg部分遍历, kswapd总是进行完整遍历 */
 	if (current_is_kswapd() || sc->memcg_full_walk)
 		partial = NULL;
 
@@ -8144,7 +8354,12 @@ static void shrink_zones(struct zonelist *zonelist, struct scan_control *sc)
 		if (zone->zone_pgdat == last_pgdat)
 			continue;
 		last_pgdat = zone->zone_pgdat;
-                /* 核心回收函数：收缩特定节点 */
+                /*
+		 * 核心回收函数：收缩特定节点
+		 * 传入符合条件的zone对应的node的pgdat
+		 * 和kswapd不一样，kswapd只回收自己所在的node
+		 * 直接回收可能会遍历回收多个符合条件的node
+		 */
 		shrink_node(zone->zone_pgdat, sc);
 	}
 
@@ -10209,6 +10424,7 @@ EXPORT_SYMBOL_GPL(check_move_unevictable_folios);
 		   │              │    │	   return MEMCG_LRU_TAIL;  //没用完，则降低放置到尾部位置，提前第二次机会
 		   │              │    │      return MEMCG_LRU_YOUNG;
 		   │              │    │
+		   │              │    │
                    │              │    ├─ try_to_shrink_lruvec()	// 不断老化和回收，直到满足需求
 		   │              │    │    │
 		   │              │    │    │  ** 页面老化 **
@@ -10241,6 +10457,7 @@ EXPORT_SYMBOL_GPL(check_move_unevictable_folios);
 		   │              │    │    │         │	 ** 推进max seq，增加最新的gen **
                    │              │    │    │         └─ inc_max_seq()
 		   │              │    │    │
+		   │              │    │    │
 		   │              │    │    │  ** 页面回收 **
                    │              │    │    └─ evict_folios()
                    │              │    │         ├─ isolate_folios()
@@ -10250,6 +10467,7 @@ EXPORT_SYMBOL_GPL(check_move_unevictable_folios);
 		   │              │    │         │    │
 		   │              │    │         │    │  // 根据type，从ANON开始遍历，
 		   │              │    │         │    │  // type=FILE，只回收FILE，type=ANON，先回收ANON再回收FILE
+		   │              │    │         │    │  // 从链表的尾部开始遍历
                    │              │    │         │    └─ scan_folios(type, tier_idx, list)
 		   │              │    │         │         │
 		   │              │    │         │         ├─ gen = lru_gen_from_seq(lrugen->min_seq[type]);	// 获取最老的gen

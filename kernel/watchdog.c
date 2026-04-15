@@ -349,6 +349,7 @@ __setup("watchdog_thresh=", watchdog_thresh_setup);
 
 static void __lockup_detector_cleanup(void);
 
+/* softlock调试增强机制 */
 #ifdef CONFIG_SOFTLOCKUP_DETECTOR_INTR_STORM
 enum stats_per_group {
 	STATS_SYSTEM,
@@ -689,6 +690,10 @@ static enum hrtimer_restart watchdog_timer_fn(struct hrtimer *hrtimer)
 	/* kick the softlockup detector */
 	if (completion_done(this_cpu_ptr(&softlockup_completion))) {
 		reinit_completion(this_cpu_ptr(&softlockup_completion));
+		/*
+		 * 在当前cpu上用stop调度类（task优先级最高）运行softlockup_fn()
+		 * hrtimer中断是每个cpu都绑定了一个，所以每个cpu都会运行
+		 */
 		stop_one_cpu_nowait(smp_processor_id(),
 				softlockup_fn, NULL,
 				this_cpu_ptr(&softlockup_stop_work));
@@ -847,6 +852,11 @@ static void softlockup_start_all(void)
 	int cpu;
 
 	cpumask_copy(&watchdog_allowed_mask, &watchdog_cpumask);
+	/*
+	 * 为每个cpu初始化softlockup需要的资源
+	 * 为每个cpu绑定一个hrtimer中断，运行watchdog_timer_fn，
+	 * 触发时在每个cpu上运行softlockup_fn()，更新时间戳
+	 */
 	for_each_cpu(cpu, &watchdog_allowed_mask)
 		smp_call_on_cpu(cpu, softlockup_start_fn, NULL, false);
 }

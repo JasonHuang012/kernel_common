@@ -3445,6 +3445,10 @@ retry:
 			set_bit(ZONE_BELOW_HIGH, &zone->flags);
 
 check_alloc_wmark:
+		/*
+		 * 前面传参，alloc_flags = ALLOC_WMARK_LOW
+		 * 这里mark是low水位线，不符合low水位线则跳过这个zone
+		 */
 		mark = wmark_pages(zone, alloc_flags & ALLOC_WMARK_MASK);
 		if (!zone_watermark_fast(zone, order, mark,
 				       ac->highest_zoneidx, alloc_flags,
@@ -4740,6 +4744,7 @@ struct page *__alloc_pages_noprof(gfp_t gfp, unsigned int order,
 				      int preferred_nid, nodemask_t *nodemask)
 {
 	struct page *page;
+	/* 赋值low水位线 */
 	unsigned int alloc_flags = ALLOC_WMARK_LOW;
 	gfp_t alloc_gfp; /* The gfp_t that was actually used for allocation */
 	struct alloc_context ac = { };

@@ -86,6 +86,7 @@ static void __cpu_stop_queue_work(struct cpu_stopper *stopper,
 					struct wake_q_head *wakeq)
 {
 	list_add_tail(&work->list, &stopper->works);
+	/* 加入work */
 	wake_q_add(wakeq, stopper->thread);
 }
 
@@ -106,6 +107,7 @@ static bool cpu_stop_queue_work(unsigned int cpu, struct cpu_stop_work *work)
 		cpu_stop_signal_done(work->done);
 	raw_spin_unlock_irqrestore(&stopper->lock, flags);
 
+	/* 唤醒work */
 	wake_up_q(&wakeq);
 	preempt_enable();
 
@@ -385,6 +387,7 @@ int stop_two_cpus(unsigned int cpu1, unsigned int cpu2, cpu_stop_fn_t fn, void *
 bool stop_one_cpu_nowait(unsigned int cpu, cpu_stop_fn_t fn, void *arg,
 			struct cpu_stop_work *work_buf)
 {
+	/* 创建并分钟一个stop调度类的work */
 	*work_buf = (struct cpu_stop_work){ .fn = fn, .arg = arg, .caller = _RET_IP_, };
 	return cpu_stop_queue_work(cpu, work_buf);
 }
