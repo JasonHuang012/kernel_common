@@ -1110,6 +1110,8 @@ static enum folio_references folio_check_references(struct folio *folio,
 
 	/*
 	 * 反向映射检查，遍历所有映射该folio的进程页表，统计引用计数
+	 *
+	 * MGLRU: folio_referenced()-->folio_referenced_one()-->lru_gen_look_around()
 	 */
 	referenced_ptes = folio_referenced(folio, 1, sc->target_mem_cgroup,
 					   &vm_flags);
@@ -4226,7 +4228,7 @@ static bool positive_ctrl_err(struct ctrl_pos *sp, struct ctrl_pos *pv)
 /* promote pages accessed through page tables */
 /*
  * 页面被访问了，调用folio_update_gen提升到最新的gen（max_seq % MAX_NR_GENS）
- * CAS无锁操作，不移动链表，只更新flags
+ * CAS无锁操作，不移动链表，只更新flags的LRU_GEN段
  */
 static int folio_update_gen(struct folio *folio, int gen)
 {
@@ -4242,7 +4244,7 @@ static int folio_update_gen(struct folio *folio, int gen)
 		/*
 		 * 判断页面是否已经被lru_gen_del_folio隔离
 		 * flags快照中的LRU_GEN为0，说明页面不在MGLRU链表中了
-		 (
+		 *
 		 * gen保存时会+1，正常挂在LRU链表上的folio LRU_GEN >= 1，
 		 * 如果LRU_GEN段为0，说明这个folio不在LRU链表上、被隔离了
 		 */
@@ -5379,15 +5381,15 @@ static bool try_to_inc_max_seq(struct lruvec *lruvec, unsigned long seq,
 	 *   同时将 mm_state->seq 推进到 seq，防止其他线程重复扫描；
 	 *   mm_list FIFO链表存放的是所有隶属于该memcg的、仍在运行的用户进程的地址空间（内核线程没有mm，不在链表中）
 	 *   相关操作接口：
-	 *   ┌────────────────────────┬──────────────┬────────────────────────────────────────────────┐
+	 *   ┌─────────────────────────────────────────────┐
 	 *   │          操作          │    调用点    │                    触发时机                    │
-	 *   ├────────────────────────┼──────────────┼────────────────────────────────────────────────┤
+	 *   ├─────────────────────────────────────────────┤
 	 *   │ lru_gen_add_mm(mm)     │ mm_init()    │ 进程创建时，mm 初始化后加入 memcg 的 mm_list   │
-	 *   ├────────────────────────┼──────────────┼────────────────────────────────────────────────┤
+	 *   ├─────────────────────────────────────────────┤
 	 *   │ lru_gen_del_mm(mm)     │ __mmdrop()   │ 进程退出，mm 引用计数归零时移出                │
-	 *   ├────────────────────────┼──────────────┼────────────────────────────────────────────────┤
+	 *   ├─────────────────────────────────────────────┤
 	 *   │ lru_gen_migrate_mm(mm) │ memcg 迁移时 │ 进程被移入新 memcg，mm 在新旧 mm_list 之间迁移 │
-	 *   └────────────────────────┴──────────────┴────────────────────────────────────────────────┘
+	 *   └────────────────────────┴────────────────────┘
 	 *
 	 * - walk_mm()：对取到的 mm 进行页表扫描，将 accesse bit被置位 对应的
 	 *   folio 通过 folio_update_gen() 提升到最新代（max_seq % MAX_NR_GENS）；
@@ -5603,6 +5605,25 @@ static void lru_gen_age_node(struct pglist_data *pgdat, struct scan_control *sc)
  * the PTE table to the Bloom filter. This forms a feedback loop between the
  * eviction and the aging.
  */
+/*
+ * 在回收路径中，通过反向映射（rmap）检查目标 folio 周围的邻近页面。
+ * 如果邻近页面也被访问过，一并提升到最新 gen，大大减少rmap vma遍历和页面的查询。
+ *
+  shrink_node()
+    └─ lru_gen_shrink_node()
+         └─ shrink_many()
+              └─ shrink_one()
+                   └─ try_to_shrink_lruvec()
+                        └─ evict_folios()
+                             └─ shrink_folio_list()
+                                  └─ lru_gen_look_around()
+                                       └─ folio_update_gen()
+  shrink_folio_list()
+    -->folio_check_references()
+       -->folio_referenced()
+	   -->folio_referenced_one()
+	       -->lru_gen_look_around()
+ */
 bool lru_gen_look_around(struct page_vma_mapped_walk *pvmw)
 {
 	int i;
@@ -5747,17 +5768,17 @@ static void lru_gen_rotate_memcg(struct lruvec *lruvec, int op)
 
 	/* see the comment on MEMCG_NR_GENS */
 	/*
-	 ┌─────────────────┬─────────────────────────┬──────────┬───────────┐
-	 │      操作       │        目标位置         │ gen 变化 │ seg 变化  │
-	 ├─────────────────┼─────────────────────────┼──────────┼───────────┤
-	 │ MEMCG_LRU_HEAD  │ 当前代的随机 bin 头部   │ 不变     │ → HEAD    │
-	 ├─────────────────┼─────────────────────────┼──────────┼───────────┤
-	 │ MEMCG_LRU_TAIL  │ 当前代的随机 bin 尾部   │ 不变     │ → TAIL    │
-	 ├─────────────────┼─────────────────────────┼──────────┼───────────┤
+	 ┌────────────────────────────────────
+	 │      操作       │        目标位置         │ gen 变化 │ seg 变化    │
+	 ├────────────────────────────────────
+	 │ MEMCG_LRU_HEAD  │ 当前代的随机 bin 头部   │ 不变     │ → HEAD     │
+	 ├────────────────────────────────────
+	 │ MEMCG_LRU_TAIL  │ 当前代的随机 bin 尾部   │ 不变     │ → TAIL     │
+	 ├────────────────────────────────────
 	 │ MEMCG_LRU_OLD   │ old 代的随机 bin 头部   │ → old    │ → default │
-	 ├─────────────────┼─────────────────────────┼──────────┼───────────┤
+	 ├────────────────────────────────────
 	 │ MEMCG_LRU_YOUNG │ young 代的随机 bin 尾部 │ → young  │ → default │
-	 └─────────────────┴─────────────────────────┴──────────┴───────────┘
+	 └────────────────────────────────────
 	 */
 	if (op == MEMCG_LRU_HEAD)
 		seg = MEMCG_LRU_HEAD;
@@ -6537,7 +6558,7 @@ static bool should_run_aging(struct lruvec *lruvec, unsigned long max_seq,
  *    reclaim.
  */
 /*
- * 扫描目标lruvec的MGLRU链表，判断是否需要老化，需需要老化则推进gen
+ * 扫描目标lruvec的MGLRU链表，判断是否需要老化，需要老化则推进gen
  *
  * 返回值：
  * 返回-1：说明老化成功，刚老化完成，需要让新的gen稳定，告诉调用者以先不回收
@@ -10433,7 +10454,7 @@ EXPORT_SYMBOL_GPL(check_move_unevictable_folios);
 		   │              │    │    │    │  判断是否需要老化:
 		   │              │    │    │    │	不需要老化: gen == 4
 		   │              │    │    │    │	需要老化  : gen <= 1
-		   │              │    │    │    │	需要老化  : gen ==3，热液过多或者冷页过少
+		   │              │    │    │    │	需要老化  : gen ==3，但是热页过多或者冷页过少
                    │              │    │    │    ├─ should_run_aging()
 		   │              │    │    │    │
                    │              │    │    │    └─ try_to_inc_max_seq()
@@ -10446,15 +10467,17 @@ EXPORT_SYMBOL_GPL(check_move_unevictable_folios);
 		   │              │    │    │         │         └─ walk_pud_range()
 		   │              │    │    │         │              └─ walk_pmd_range()
 		   │              │    │    │         │                    ├─ walk_pte_range()
-		   │              │    │    │         │                    │    └─ folio_update_gen()  ← update gen 调用点1，将页面提升到最新的gen
+		   │              │    │    │         │                    │    └─ folio_update_gen()←update gen 调用点1，将页面提升到最新gen（只改flags）
 		   │              │    │    │         │                    │
 		   │              │    │    │         │                    └─ walk_pmd_range_locked()
-		   │              │    │    │         │                         └─ folio_update_gen()  ← update gen 调用点2
+		   │              │    │    │         │                         └─ folio_update_gen()←update gen 调用点2
 		   │              │    │    │         │
-		   │              │    │    │         │	// 这里 update gen，后面哪里将其放到对应的gen?
+		   │              │    │    │         │ // 这里 update gen，后面哪里将其放到对应的gen? 
+		   │              │    │    │         │		答：sort_folios根据gen，将页面提升
 		   │              │    │    │         │ // MGLRU总是回收最老的gen，在哪里体现？上面walk_mm扫描的页面都是最老的gen吗
+		   │              │    │    │         │		答：scan_folios中用lrugen->min_seq[type]获取最老gen的链表
 		   │              │    │    │         │
-		   │              │    │    │         │	 ** 推进max seq，增加最新的gen **
+		   │              │    │    │         │  ** 推进max seq，增加最新的gen **
                    │              │    │    │         └─ inc_max_seq()
 		   │              │    │    │
 		   │              │    │    │
@@ -10463,7 +10486,7 @@ EXPORT_SYMBOL_GPL(check_move_unevictable_folios);
                    │              │    │         ├─ isolate_folios()
 		   │              │    │         │    │  //通过swappiness和min_seq判断应从哪一类页面开始回收
                    │              │    │         │    ├─ type = LRU_GEN_FILE or LRU_GEN_ANON
-                   │              │    │         │    ├─ get_tier_idx()		//获取可以被回收的最大tier
+                   │              │    │         │    ├─ tier_idx = get_tier_idx()		//获取可以被回收的最大tier
 		   │              │    │         │    │
 		   │              │    │         │    │  // 根据type，从ANON开始遍历，
 		   │              │    │         │    │  // type=FILE，只回收FILE，type=ANON，先回收ANON再回收FILE
@@ -10536,5 +10559,16 @@ EXPORT_SYMBOL_GPL(check_move_unevictable_folios);
                    └─ [balanced] 退出，kswapd 回到 kswapd_try_to_sleep()
 
 
-
+** 文件页或者匿名页首次被放入LRU/MGLRU链表的流程 **
+ page fault (do_anonymous_page / do_fault / filemap_fault 等)
+    └─ folio_add_lru(folio) / folio_add_lru_vma(folio, vma)
+         └─ folio_set_active(folio)   ← MGLRU特有：如果在 fault 路径中，标记为 active，MGLRU将新建页面加入最新的gen，传统LRU则是inactive链表
+         └─ folio_batch_add_and_move(folio, lru_add, false)
+                 └─ 加入 per-CPU folio_batch 缓存（lru_add batch）
+                      └─ 缓存满 / 主动 drain 时：
+                           folio_batch_move_lru(fbatch, lru_add)
+                                └─ lru_add(lruvec, folio)
+                                     └─ lruvec_add_folio(lruvec, folio)
+                                          └─ lru_gen_add_folio(lruvec, folio, false)
+                                               ← 真正加入 MGLRU/LRU 链表
  */

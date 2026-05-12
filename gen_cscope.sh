@@ -27,7 +27,7 @@
       grep -v "^./\.git" | \
       grep -v "^./scripts" | \
       grep -v "^./rust" | \
-      grep -v "^./drivers" | \
+      #grep -v "^./drivers" | \
       grep -v "^./sound" | \
       grep -v "^./crypto" | \
       grep -v "^./security" | \
